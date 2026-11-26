@@ -170,10 +170,11 @@ class OpenAICompatibleLLMProvider:
         self, *, fault_type: str, service_name: str, alert_payload: dict[str, Any], skill: RunbookSkill
     ) -> CoordinatorPlan:
         system_prompt = (
-            "You are the AIOps Coordinator Agent. Analyze the incident and matched Runbook Skill, "
-            "and output ONLY a JSON object with keys: "
-            '"summary" (concise triage plan), "log_tool" (exact read-only log tool name), '
-            '"db_tool" (exact read-only DB/cache tool name).'
+            "你是 AIOps 协调规划智能体（Coordinator Agent）。请结合告警信息和匹配的 Runbook Skill 制定排查计划，"
+            "并仅输出一个 JSON 对象，包含以下键："
+            '"summary"（使用简体中文撰写简明分诊与排障计划）、'
+            '"log_tool"（必须原样保留匹配的只读日志工具名）、'
+            '"db_tool"（必须原样保留匹配的只读数据库/缓存工具名）。'
         )
         user_payload = {
             "fault_type": fault_type,
@@ -210,9 +211,9 @@ class OpenAICompatibleLLMProvider:
             else skill.diagnostic_tools.db_agent
         )
         system_prompt = (
-            f"You are the {agent_role} AIOps Agent. Select ONLY a READ_ONLY diagnostic tool from "
-            "the matched Runbook Skill. Output ONLY a JSON object with keys: "
-            '"tool_name" (exact tool name) and "reasoning" (brief justification).'
+            f"你是 {agent_role} AIOps 只读诊断智能体。请从匹配的 Runbook Skill 中选择唯一对应的 READ_ONLY 只读诊断工具。"
+            "仅输出一个 JSON 对象，包含以下键："
+            '"tool_name"（原样保留精确工具名）和 "reasoning"（使用简体中文简述选择依据）。'
         )
         user_payload = {
             "agent_role": agent_role,
@@ -241,10 +242,14 @@ class OpenAICompatibleLLMProvider:
         skill: RunbookSkill,
     ) -> RemediationProposal:
         system_prompt = (
-            "You are the AIOps Remediation Agent. Correlate the shared blackboard diagnostic evidence "
-            "and Runbook Skill remediation template. Output ONLY a JSON object with keys: "
-            '"root_cause_summary", "tool_name", "proposed_command", "blast_radius", '
-            '"rollback_command", "rationale".'
+            "你是 AIOps 修复方案生成智能体（Remediation Agent）。请综合共享黑板中的只读诊断证据与 Runbook Skill 模板，"
+            "仅输出一个 JSON 对象，包含以下键："
+            '"root_cause_summary"（使用简体中文精准总结根因与关键指标）、'
+            '"tool_name"（原样保留精确高危修复工具名）、'
+            '"proposed_command"（原样保留可执行修复命令）、'
+            '"blast_radius"（使用简体中文说明影响面）、'
+            '"rollback_command"（原样保留回滚命令）、'
+            '"rationale"（使用简体中文说明方案依据与风险提示）。'
         )
         user_payload = {
             "fault_type": fault_type,

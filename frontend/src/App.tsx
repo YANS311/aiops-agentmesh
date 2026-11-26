@@ -62,7 +62,7 @@ export default function App() {
   const [traces, setTraces] = useState<TraceEvent[]>([]);
   const [operatorName, setOperatorName] = useState<string>('sre-oncall');
   const [approvalComment, setApprovalComment] = useState<string>(
-    'Verified PG16 idle-in-tx diagnostics; safe to execute.'
+    '已核对只读诊断证据，确认安全并放行执行。'
   );
   const [busyAction, setBusyAction] = useState<boolean>(false);
   const [uiError, setUiError] = useState<string | null>(null);
@@ -220,10 +220,10 @@ export default function App() {
             </div>
             <div>
               <h1 className="text-lg font-semibold tracking-tight text-white">
-                AgentMesh AIOps Control Plane
+                AgentMesh AIOps 智能排障控制台
               </h1>
               <p className="text-xs text-slate-400">
-                PG16 SKIP LOCKED • Redis Streams (Consumer Group + ACK) • Fail-Closed Human Gate
+                PG16 SKIP LOCKED 事务队列 • Redis Streams（Consumer Group + ACK）• Fail-Closed 人工审批门禁
               </p>
             </div>
           </div>
@@ -237,12 +237,12 @@ export default function App() {
               <span>
                 {health
                   ? `PG16: ${health.postgres} | Redis: ${health.redis}`
-                  : 'Checking infra...'}
+                  : '正在检查基础设施...'}
               </span>
             </div>
 
             <select
-              aria-label="Fault preset"
+              aria-label="故障场景预设"
               value={selectedFault}
               onChange={(e) => setSelectedFault(e.target.value)}
               className="bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
@@ -268,7 +268,7 @@ export default function App() {
               className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-sm font-medium text-white transition cursor-pointer"
             >
               <Play className="h-4 w-4" />
-              Inject Fault Alert
+              注入故障告警
             </button>
           </div>
         </div>
@@ -288,7 +288,7 @@ export default function App() {
         <aside className="lg:col-span-4 flex flex-col gap-3">
           <div className="flex items-center justify-between">
             <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Incidents ({incidents.length})
+              故障事件列表 ({incidents.length})
             </h2>
           </div>
 
@@ -298,7 +298,7 @@ export default function App() {
           >
             {incidents.length === 0 ? (
               <div className="rounded-xl border border-dashed border-slate-800 p-6 text-center text-sm text-slate-500">
-                No incidents yet. Click <strong>Inject Fault Alert</strong> to launch multi-agent triage.
+                暂无故障单，点击右上角 <strong>注入故障告警</strong> 启动多智能体协同排障。
               </div>
             ) : (
               incidents.map((inc) => {
@@ -340,7 +340,7 @@ export default function App() {
         <section className="lg:col-span-8 flex flex-col gap-5">
           {!detail ? (
             <div className="rounded-xl border border-slate-800 bg-slate-900/40 p-12 text-center text-slate-400">
-              Select an incident from the left or inject a new fault alert to inspect live multi-agent orchestration.
+              请从左侧选择一个故障事件，或点击右上角注入新故障告警以查看实时多智能体排障过程。
             </div>
           ) : (
             <>
@@ -352,7 +352,7 @@ export default function App() {
                       <span className="font-mono">{detail.id}</span>
                       {matchedSkill && (
                         <span className="px-2 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                          Skill: {matchedSkill.skill_id}
+                          Runbook Skill: {matchedSkill.skill_id}
                         </span>
                       )}
                     </div>
@@ -371,7 +371,7 @@ export default function App() {
 
                 {detail.root_cause_summary && (
                   <div className="mt-4 rounded-lg bg-slate-950/70 border border-slate-800 p-3.5 text-sm text-slate-200">
-                    <span className="font-semibold text-indigo-300">Root Cause Analysis: </span>
+                    <span className="font-semibold text-indigo-300">根因分析：</span>
                     {detail.root_cause_summary}
                   </div>
                 )}
@@ -400,17 +400,17 @@ export default function App() {
                 >
                   <div className="flex items-center gap-2.5 text-amber-300 font-semibold text-base mb-2">
                     <ShieldAlert className="h-5 w-5" />
-                    <span>High-Risk Write Gate — Human Approval Required (Fail-Closed)</span>
+                    <span>高危写操作门禁 — 需人工审批放行（Fail-Closed）</span>
                   </div>
                   <p className="text-xs text-amber-200/80 mb-3">
-                    Read-only diagnostics were auto-allowed. Execution is suspended until an operator explicitly approves this{' '}
-                    <span className="font-semibold">{detail.approval.risk_level}</span>-risk remediation.
+                    只读诊断已自动放行；当前{' '}
+                    <span className="font-semibold">{detail.approval.risk_level}</span> 级高危写入操作已强制挂起，等待运维人员确认后方可执行。
                   </p>
 
                   <div className="rounded-lg bg-slate-950 border border-slate-800 p-3 mb-3">
                     <div className="text-[11px] uppercase tracking-wider text-slate-400 mb-1 flex items-center gap-1.5">
                       <Terminal className="h-3.5 w-3.5 text-amber-400" />
-                      Proposed Remediation Command
+                      待执行修复命令
                     </div>
                     <pre className="text-xs font-mono text-emerald-300 whitespace-pre-wrap">
                       {detail.approval.proposed_command}
@@ -419,7 +419,7 @@ export default function App() {
 
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
                     <div>
-                      <label className="block text-xs text-slate-400 mb-1">Operator</label>
+                      <label className="block text-xs text-slate-400 mb-1">审批人</label>
                       <input
                         type="text"
                         value={operatorName}
@@ -428,7 +428,7 @@ export default function App() {
                       />
                     </div>
                     <div>
-                      <label className="block text-xs text-slate-400 mb-1">Approval Note</label>
+                      <label className="block text-xs text-slate-400 mb-1">审批备注</label>
                       <input
                         type="text"
                         value={approvalComment}
@@ -447,7 +447,7 @@ export default function App() {
                       className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 text-sm font-semibold text-white transition cursor-pointer"
                     >
                       <ShieldCheck className="h-4 w-4" />
-                      Approve &amp; Execute Remediation
+                      批准并执行修复
                     </button>
 
                     <button
@@ -458,7 +458,7 @@ export default function App() {
                       className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-rose-600/80 hover:bg-rose-500 disabled:opacity-50 text-sm font-semibold text-white transition cursor-pointer"
                     >
                       <XCircle className="h-4 w-4" />
-                      Reject Action
+                      拒绝执行
                     </button>
                   </div>
                 </div>
@@ -469,9 +469,9 @@ export default function App() {
                 <div className="flex items-center justify-between mb-3">
                   <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                     <AlertTriangle className="h-4 w-4 text-indigo-400" />
-                    Live Multi-Agent Execution Trace (SSE)
+                    多智能体实时执行轨迹（SSE）
                   </h3>
-                  <span className="text-xs text-slate-400">{traces.length} events</span>
+                  <span className="text-xs text-slate-400">{traces.length} 条事件</span>
                 </div>
 
                 <div
@@ -518,12 +518,12 @@ export default function App() {
                 <div className="flex items-center justify-between">
                   <h3 className="text-sm font-semibold text-white flex items-center gap-2">
                     <Archive className="h-4 w-4 text-emerald-400" />
-                    Shared Blackboard &amp; Archived Trajectory
+                    共享黑板证据 &amp; 排障轨迹归档
                   </h3>
                   {detail.trajectory && (
                     <span className="inline-flex items-center gap-1 text-xs text-emerald-300 font-medium">
                       <CheckCircle2 className="h-3.5 w-3.5" />
-                      Trajectory Archived
+                      Trajectory 已归档
                     </span>
                   )}
                 </div>
@@ -531,7 +531,7 @@ export default function App() {
                 {Object.keys(evidence).length > 0 && (
                   <div>
                     <div className="text-xs font-medium text-slate-400 mb-1.5">
-                      PG16 Shared Blackboard Evidence
+                      PG16 共享黑板只读诊断证据
                     </div>
                     <pre className="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-x-auto text-cyan-200">
                       {JSON.stringify(evidence, null, 2)}
@@ -542,12 +542,12 @@ export default function App() {
                 {detail.trajectory && (
                   <div className="rounded-lg border border-emerald-500/40 bg-emerald-950/15 p-4 space-y-2">
                     <div className="text-xs font-semibold text-emerald-300">
-                      Hermes-Style Incident Trajectory • {detail.trajectory.skill_id}
+                      Hermes 风格排障轨迹归档 • {detail.trajectory.skill_id}
                     </div>
                     <div className="text-xs text-slate-300">
-                      <strong>Approved By:</strong>{' '}
+                      <strong>审批人：</strong>{' '}
                       {detail.approval?.approved_by ?? 'N/A'} |{' '}
-                      <strong>Resolution Command:</strong>{' '}
+                      <strong>执行命令：</strong>{' '}
                       <code className="text-emerald-300">{detail.trajectory.resolution_command}</code>
                     </div>
                     <pre className="text-[11px] font-mono bg-slate-950 border border-slate-800 rounded p-2.5 overflow-x-auto text-slate-300 max-h-48">
