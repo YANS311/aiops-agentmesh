@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as aioredis
 
-from app.agents.llm import MockLLMProvider
+from app.agents.llm import LLMProvider, build_llm_provider
 from app.agents.orchestrator import AgentWorker, AIOpsOrchestrator
 from app.agents.tools import ToolRegistry
 from app.agents.trajectory_consumer import TrajectoryStreamConsumer
@@ -22,6 +22,7 @@ def create_app(
     database_url: str | None = None,
     redis_url: str | None = None,
     skills_dir: Path | None = None,
+    llm_provider: LLMProvider | None = None,
     start_worker: bool = True,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
@@ -38,7 +39,7 @@ def create_app(
         redis_bus = RedisEventBus(redis_client)
         skill_registry = SkillRegistry(resolved_skills_dir)
         tool_registry = ToolRegistry()
-        llm_provider = MockLLMProvider()
+        resolved_llm = llm_provider or build_llm_provider(resolved_settings)
 
         trajectory_consumer = TrajectoryStreamConsumer(
             session_factory=session_factory,
@@ -52,7 +53,7 @@ def create_app(
             redis_bus=redis_bus,
             skill_registry=skill_registry,
             tool_registry=tool_registry,
-            llm_provider=llm_provider,
+            llm_provider=resolved_llm,
             step_delay_ms=resolved_settings.step_delay_ms,
             trajectory_consumer=trajectory_consumer,
         )

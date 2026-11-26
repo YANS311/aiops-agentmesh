@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     backend_host: str = "127.0.0.1"
     backend_port: int = 8016
     llm_provider: str = "mock"
+    llm_base_url: str = "https://api.deepseek.com/v1"
+    llm_model: str = "deepseek-chat"
+    llm_api_key: str = ""
+    llm_timeout_seconds: float = 45.0
     step_delay_ms: int = 0
     skills_dir: Path = Path(__file__).resolve().parents[1] / "skills"
 

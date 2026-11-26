@@ -13,6 +13,13 @@ from app.db.base import create_engine_and_sessionmaker, init_db
 from app.redis_bus.events import RedisEventBus
 
 
+@pytest.fixture(autouse=True)
+def force_mock_llm_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Ensure pytest always uses LLM_PROVIDER=mock (zero external API cost)."""
+    monkeypatch.setenv("LLM_PROVIDER", "mock")
+    get_settings.cache_clear()
+
+
 @pytest_asyncio.fixture
 async def pg_engine_and_factory() -> AsyncIterator[
     tuple[AsyncEngine, async_sessionmaker[AsyncSession]]
