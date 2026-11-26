@@ -1,8 +1,11 @@
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import logging
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
+
+from redis.exceptions import RedisError
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,11 +24,15 @@ from app.db.models import (
     RemediationApproval,
     TraceEvent,
 )
+from app.agents.reliability import OutboxRelay
 from app.db.repositories import (
+    DEFAULT_LEASE_SECONDS,
     append_trace_event,
     claim_next_queued_task,
     get_approval_for_update,
     get_incident_full,
+    renew_task_lease,
+    serialize_trace_event,
 )
 from app.redis_bus.events import RedisEventBus
 from app.skills.loader import SkillRegistry
@@ -52,17 +59,15 @@ class FailClosedBlockedError(PermissionError):
         self.trace_event = trace_event
 
 
-def serialize_trace_event(ev: TraceEvent) -> dict[str, Any]:
-    return {
-        "id": ev.id,
-        "incident_id": str(ev.incident_id),
-        "agent_role": ev.agent_role,
-        "event_type": ev.event_type,
-        "risk_tier": ev.risk_tier,
-        "summary": ev.summary,
-        "payload": ev.payload,
-        "created_at": ev.created_at.isoformat() if ev.created_at else None,
-    }
+__all__ = [
+    "AIOpsOrchestrator",
+    "AgentWorker",
+    "ConflictStateError",
+    "FailClosedBlockedError",
+    "IncidentNotFoundError",
+    "TERMINAL_INCIDENT_STATUSES",
+    "serialize_trace_event",
+]
 
 
 class AIOpsOrchestrator:
@@ -78,6 +83,8 @@ class AIOpsOrchestrator:
         llm_provider: LLMProvider,
         step_delay_ms: int = 0,
         trajectory_consumer: "TrajectoryStreamConsumer | None" = None,
+        outbox_relay: OutboxRelay | None = None,
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
     ) -> None:
         self.session_factory = session_factory
         self.redis_bus = redis_bus
@@ -87,6 +94,10 @@ class AIOpsOrchestrator:
         self.llm = llm_provider
         self.step_delay_ms = step_delay_ms
         self.trajectory_consumer = trajectory_consumer
+        self.outbox_relay = outbox_relay or OutboxRelay(
+            session_factory=session_factory, redis_bus=redis_bus
+        )
+        self.lease_seconds = lease_seconds
         self._worker_wakeups: set[asyncio.Event] = set()
 
     def register_worker_wakeup(self, ev: asyncio.Event) -> None:
@@ -102,10 +113,18 @@ class AIOpsOrchestrator:
     async def _publish_pending(
         self, incident_id: UUID, events: list[TraceEvent], blackboard: dict[str, Any] | None = None
     ) -> None:
+        """Trace events were already written to outbox_events inside the business transaction.
+
+        No bare XADD here: we only refresh the (non-authoritative) blackboard cache and wake
+        the OutboxRelay, so a Redis outage can never lose an event or break the business path.
+        """
         if blackboard is not None:
-            await self.redis_bus.set_blackboard_cache(incident_id, blackboard)
-        for ev in events:
-            await self.redis_bus.publish_trace_event(incident_id, serialize_trace_event(ev))
+            try:
+                await self.redis_bus.set_blackboard_cache(incident_id, blackboard)
+            except RedisError:
+                logger.warning("Blackboard cache refresh skipped (Redis unavailable)", exc_info=True)
+        if events:
+            self.outbox_relay.notify()
 
     async def inject_incident(
         self,
@@ -184,16 +203,56 @@ class AIOpsOrchestrator:
         return incident
 
     async def process_one_task(self, worker_id: str = "worker-1") -> bool:
-        """Claim and execute a single QUEUED task via PG16 FOR UPDATE SKIP LOCKED."""
+        """Claim one QUEUED task (FOR UPDATE SKIP LOCKED + lease) and execute it."""
         async with self.session_factory() as claim_session:
             async with claim_session.begin():
-                task = await claim_next_queued_task(claim_session, worker_id)
+                task = await claim_next_queued_task(
+                    claim_session, worker_id, lease_seconds=self.lease_seconds
+                )
                 if task is None:
                     return False
                 task_id = task.id
-                incident_id = task.incident_id
-                agent_role = task.agent_role
 
+        await self.execute_claimed_task(task_id, worker_id)
+        return True
+
+    async def _lease_heartbeat(self, task_id: UUID, worker_id: str) -> None:
+        interval = max(0.05, self.lease_seconds / 3.0)
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                async with self.session_factory() as hb_session:
+                    async with hb_session.begin():
+                        await renew_task_lease(
+                            hb_session,
+                            task_id=task_id,
+                            worker_id=worker_id,
+                            lease_seconds=self.lease_seconds,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "Lease heartbeat failed for task %s (worker=%s)", task_id, worker_id, exc_info=True
+                )
+
+    async def execute_claimed_task(self, task_id: UUID, worker_id: str) -> bool:
+        """Execute a claimed task while renewing its lease.
+
+        Returns False when the lease was lost (fencing): a zombie worker whose task was
+        reclaimed by the watchdog can never commit duplicate side effects.
+        """
+        heartbeat = asyncio.create_task(
+            self._lease_heartbeat(task_id, worker_id), name=f"lease-heartbeat-{task_id}"
+        )
+        try:
+            return await self._execute_claimed_task(task_id, worker_id)
+        finally:
+            heartbeat.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat
+
+    async def _execute_claimed_task(self, task_id: UUID, worker_id: str) -> bool:
         if self.step_delay_ms > 0:
             await asyncio.sleep(self.step_delay_ms / 1000.0)
 
@@ -207,7 +266,19 @@ class AIOpsOrchestrator:
                     await session.execute(
                         select(AgentTask).where(AgentTask.id == task_id).with_for_update()
                     )
-                ).scalar_one()
+                ).scalar_one_or_none()
+                # Fencing token check: only the current lease owner may commit side effects.
+                if task is None or task.status != "RUNNING" or task.lease_owner != worker_id:
+                    logger.warning(
+                        "Fencing: worker %s no longer owns task %s (status=%s, owner=%s); aborting.",
+                        worker_id,
+                        task_id,
+                        task.status if task is not None else None,
+                        task.lease_owner if task is not None else None,
+                    )
+                    return False
+                incident_id = task.incident_id
+                agent_role = task.agent_role
                 incident = (
                     await session.execute(
                         select(Incident).where(Incident.id == incident_id).with_for_update()
@@ -278,6 +349,9 @@ class AIOpsOrchestrator:
                             )
                         )
                     blackboard_snapshot = dict(incident.blackboard or {})
+
+                if task.status != "RUNNING":
+                    task.lease_expires_at = None
 
         await self._publish_pending(incident_id, pending_events, blackboard_snapshot)
         if enqueued_more:
@@ -826,8 +900,10 @@ class AIOpsOrchestrator:
             assert blocked_trace is not None
             raise FailClosedBlockedError(str(blocked_exc), blocked_trace)
 
+        await self.outbox_relay.drain()
         if self.trajectory_consumer is not None:
             await self.trajectory_consumer.drain_until_empty()
+            await self.outbox_relay.drain()
 
         async with self.session_factory() as read_sess:
             refreshed = await get_incident_full(read_sess, incident_id)
@@ -852,17 +928,25 @@ class AgentWorker:
         self._task: asyncio.Task[None] | None = None
 
     async def run_until_quiescent(self, max_steps: int = 25) -> int:
+        """Deterministically drive tasks -> outbox relay -> stream consumer until idle.
+
+        Returns the number of PG16 agent tasks executed.
+        """
         processed = 0
-        while processed < max_steps:
-            did_work = await self.orchestrator.process_one_task(self.worker_id)
-            if did_work:
+        consumer_rounds = 0
+        relay = self.orchestrator.outbox_relay
+        while processed < max_steps and consumer_rounds < max_steps:
+            if await self.orchestrator.process_one_task(self.worker_id):
                 processed += 1
                 continue
+            await relay.drain()
             if self.trajectory_consumer is not None:
                 drained = await self.trajectory_consumer.drain_until_empty()
                 if drained > 0:
+                    consumer_rounds += 1
                     continue
             break
+        await relay.drain()
         return processed
 
     async def _loop(self) -> None:
@@ -891,10 +975,23 @@ class AgentWorker:
             self._stop_event.clear()
             self._task = asyncio.create_task(self._loop(), name=f"agent-worker-{self.worker_id}")
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 10.0) -> bool:
+        """Graceful drain: stop claiming new tasks and wait (bounded) for the in-flight task.
+
+        Returns True if the in-flight work finished within the timeout. On timeout the task is
+        cancelled; its lease then expires and the LeaseWatchdog reclaims it (no work is lost).
+        """
         self._stop_event.set()
         self._wakeup_event.set()
         self.orchestrator.notify_worker()
+        drained = True
         if self._task is not None:
-            await self._task
+            try:
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            except TimeoutError:
+                drained = False
+                self._task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task
             self._task = None
+        return drained

@@ -53,18 +53,21 @@ class RedisEventBus:
             "risk_tier": str(event_payload["risk_tier"]),
             "data": json.dumps(event_payload, default=str),
         }
-        inc_entry_id = await self.redis.xadd(
-            incident_events_stream(incident_id),
-            fields,
-            maxlen=2000,
-            approximate=True,
-        )
-        global_entry_id = await self.redis.xadd(
-            GLOBAL_EVENTS_STREAM,
-            fields,
-            maxlen=10000,
-            approximate=True,
-        )
+        # MULTI/EXEC: both streams receive the event atomically (or neither does).
+        async with self.redis.pipeline(transaction=True) as pipe:
+            pipe.xadd(
+                incident_events_stream(incident_id),
+                fields,
+                maxlen=2000,
+                approximate=True,
+            )
+            pipe.xadd(
+                GLOBAL_EVENTS_STREAM,
+                fields,
+                maxlen=10000,
+                approximate=True,
+            )
+            inc_entry_id, global_entry_id = await pipe.execute()
         return str(inc_entry_id), str(global_entry_id)
 
     async def ensure_consumer_group(

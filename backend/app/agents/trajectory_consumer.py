@@ -1,9 +1,12 @@
 import asyncio
+from contextlib import suppress
 from datetime import datetime, timezone
 import logging
 import time
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
+
+from redis.exceptions import RedisError
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -21,6 +24,9 @@ from app.redis_bus.events import (
     TRAJECTORY_CONSUMER_GROUP,
     RedisEventBus,
 )
+
+if TYPE_CHECKING:
+    from app.agents.reliability import OutboxRelay
 
 logger = logging.getLogger(__name__)
 
@@ -49,9 +55,11 @@ class TrajectoryStreamConsumer:
         consumer_name: str = "archiver-1",
         group_name: str = TRAJECTORY_CONSUMER_GROUP,
         stream_key: str = GLOBAL_EVENTS_STREAM,
+        outbox_relay: "OutboxRelay | None" = None,
     ) -> None:
         self.session_factory = session_factory
         self.redis_bus = redis_bus
+        self.outbox_relay = outbox_relay
         self.consumer_name = consumer_name
         self.group_name = group_name
         self.stream_key = stream_key
@@ -209,11 +217,16 @@ class TrajectoryStreamConsumer:
                     blackboard_copy = dict(incident.blackboard)
 
         if blackboard_copy is not None:
-            await self.redis_bus.set_blackboard_cache(incident_id, blackboard_copy)
-        for ev in pending_events:
-            await self.redis_bus.publish_trace_event(incident_id, _serialize_trace(ev))
+            try:
+                await self.redis_bus.set_blackboard_cache(incident_id, blackboard_copy)
+            except RedisError:
+                logger.warning("Blackboard cache refresh skipped (Redis unavailable)", exc_info=True)
+        # TRAJECTORY_ARCHIVED / INCIDENT_RESOLVED were written to outbox_events in the same
+        # PG16 transaction as the trajectory; the OutboxRelay publishes them (no bare XADD).
+        if pending_events and self.outbox_relay is not None:
+            self.outbox_relay.notify()
 
-        # XACK only after PostgreSQL 16 commit and downstream trace publish succeed.
+        # XACK only after the PostgreSQL 16 transaction has committed.
         await self.redis_bus.ack(self.stream_key, self.group_name, entry_id)
 
     async def _process_entries(self, entries: list[tuple[str, dict[str, Any]]]) -> int:
@@ -285,12 +298,18 @@ class TrajectoryStreamConsumer:
                 self._loop(), name=f"trajectory-stream-consumer-{self.consumer_name}"
             )
 
-    async def stop(self) -> None:
+    async def stop(self, timeout: float = 5.0) -> None:
+        """Graceful stop: finish the in-flight batch (bounded), then exit.
+
+        If cancelled mid-entry, the PG transaction rolls back and the entry stays in the PEL,
+        to be recovered via XAUTOCLAIM by a surviving consumer.
+        """
         self._stop_event.set()
         if self._task is not None:
-            self._task.cancel()
             try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
+                await asyncio.wait_for(asyncio.shield(self._task), timeout=timeout)
+            except TimeoutError:
+                self._task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await self._task
             self._task = None

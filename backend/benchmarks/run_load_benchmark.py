@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.agents.llm import MockLLMProvider
 from app.agents.orchestrator import AgentWorker, AIOpsOrchestrator
+from app.agents.reliability import OutboxRelay
 from app.agents.tools import ToolRegistry
 from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 from app.config import get_settings
@@ -216,7 +217,7 @@ async def run_tier(
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE TABLE incident_trajectories, trace_events, "
+                "TRUNCATE TABLE outbox_events, incident_trajectories, trace_events, "
                 "remediation_approvals, agent_tasks, incidents RESTART IDENTITY CASCADE"
             )
         )
@@ -231,11 +232,14 @@ async def run_tier(
     skill_registry = SkillRegistry(settings.skills_dir)
     tool_registry = ToolRegistry()
 
+    outbox_relay = OutboxRelay(session_factory=session_factory, redis_bus=redis_bus)
+
     archivers = [
         TrajectoryStreamConsumer(
             session_factory=session_factory,
             redis_bus=redis_bus,
             consumer_name=f"bench-archiver-{i + 1}",
+            outbox_relay=outbox_relay,
         )
         for i in range(archiver_count)
     ]
@@ -252,12 +256,14 @@ async def run_tier(
         llm_provider=llm_provider,
         step_delay_ms=0,
         trajectory_consumer=archivers[0],
+        outbox_relay=outbox_relay,
     )
     workers = [
         AgentWorker(orchestrator, worker_id=f"bench-worker-{i + 1}")
         for i in range(worker_count)
     ]
 
+    outbox_relay.start()
     for arch in archivers:
         arch.start()
     for w in workers:
@@ -309,8 +315,8 @@ async def run_tier(
             extra_attempts = int(
                 (
                     await sess.execute(
-                        select(func.coalesce(func.sum(AgentTask.attempts - 1), 0)).where(
-                            AgentTask.attempts > 1
+                        select(func.coalesce(func.sum(AgentTask.attempt_count - 1), 0)).where(
+                            AgentTask.attempt_count > 1
                         )
                     )
                 ).scalar_one()
@@ -379,6 +385,7 @@ async def run_tier(
             await w.stop()
         for arch in archivers:
             await arch.stop()
+        await outbox_relay.stop()
         await redis_client.aclose()
         await engine.dispose()
 

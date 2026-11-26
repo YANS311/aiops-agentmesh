@@ -26,7 +26,10 @@ export interface AgentTask {
   input_payload: Record<string, unknown>;
   output_payload: Record<string, unknown>;
   worker_id: string | null;
-  attempts: number;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  attempt_count: number;
+  max_attempts: number;
   error_message: string | null;
   created_at: string;
   completed_at: string | null;

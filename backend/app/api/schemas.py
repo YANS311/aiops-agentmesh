@@ -49,7 +49,10 @@ class AgentTaskOut(BaseModel):
     input_payload: dict[str, Any]
     output_payload: dict[str, Any]
     worker_id: str | None
-    attempts: int
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    attempt_count: int
+    max_attempts: int
     error_message: str | None
     created_at: datetime
     completed_at: datetime | None

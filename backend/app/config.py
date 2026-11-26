@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     llm_api_key: str = ""
     llm_timeout_seconds: float = 45.0
     step_delay_ms: int = 0
+    task_lease_seconds: float = 30.0
+    watchdog_interval_seconds: float = 5.0
+    outbox_batch_size: int = 100
+    outbox_poll_interval_seconds: float = 0.2
+    shutdown_timeout_seconds: float = 10.0
     skills_dir: Path = Path(__file__).resolve().parents[1] / "skills"
 
 

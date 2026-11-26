@@ -4,12 +4,15 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
 
 ## Architecture Highlights (Phase 1)
 
-- **PostgreSQL 16 Transactional Task Dispatch**:
+- **PostgreSQL 16 Transactional Task Dispatch & Lease Watchdog**:
   - `JSONB` columns (`alert_payload`, `blackboard`, `trace_events.payload`, `trajectory_doc`) backed by `GIN` indexes.
-  - Concurrent task queue claimed atomically via `SELECT ... FOR UPDATE SKIP LOCKED`.
-- **Redis 7 Streams (Consumer Group + `XACK` + `XAUTOCLAIM`)**:
+  - Concurrent task queue claimed atomically via `SELECT ... FOR UPDATE SKIP LOCKED` with time-bound worker leases (`lease_owner`, `lease_expires_at`, `attempt_count`, `max_attempts`), periodic heartbeat renewal, fencing checks, and background `LeaseWatchdog` (requeues zombie tasks or dead-letters after `max_attempts`).
+- **Transactional Outbox (`outbox_events`) + Redis 7 Streams (`Consumer Group + XACK + XAUTOCLAIM`)**:
+  - All `TraceEvent` rows atomically write `outbox_events` in the same PG16 transaction (no bare `XADD` outside DB transactions); `OutboxRelay` relays pending batches via `FOR UPDATE SKIP LOCKED` + advisory lock with exponential backoff, guaranteeing zero event loss across transient Redis outages.
   - **Real-Time Incident Event Stream** (`stream:incident:{id}:events`): SSE subscribers create an ephemeral consumer group (`cg:sse:*`), read via `XREADGROUP`, deduplicate against PG16 `trace_events.id`, call `XACK` on each frame, and clean up via `XGROUP DESTROY`.
   - **Trajectory Archival Consumer** (`stream:aiops:events` + `cg:trajectory-archiver`): consumes `HIGH_RISK_EXECUTED` events, archives `IncidentTrajectory` and transitions `Incident` to `RESOLVED` in PG16, calls `XACK` only after PG16 commit, and recovers unacknowledged PEL entries via `XAUTOCLAIM`.
+- **Graceful Shutdown**:
+  - FastAPI `lifespan` stops claiming new tasks, drains in-flight worker tasks and flushes pending `outbox_events` (bounded by `SHUTDOWN_TIMEOUT_SECONDS`) before closing Redis and PG16 connection pools.
 - **Hermes-Inspired Extensions**:
   - **Declarative Runbook Skills** (`backend/skills/*.yaml`): SOP definitions mapping fault types to `READ_ONLY` diagnostic tools and `HIGH_RISK_WRITE` remediations.
   - **Trajectory Archival** (`incident_trajectories`): Post-resolution structured JSONB archive of evidence, approval audit, execution output, `stream_consumption` metadata, and trace timeline.

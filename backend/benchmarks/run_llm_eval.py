@@ -41,6 +41,7 @@ from app.agents.orchestrator import (
     AIOpsOrchestrator,
     FailClosedBlockedError,
 )
+from app.agents.reliability import OutboxRelay
 from app.agents.tools import ToolRegistry
 from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 from app.config import get_settings
@@ -395,7 +396,7 @@ async def run_evaluation() -> dict[str, Any]:
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE TABLE incident_trajectories, trace_events, "
+                "TRUNCATE TABLE outbox_events, incident_trajectories, trace_events, "
                 "remediation_approvals, agent_tasks, incidents RESTART IDENTITY CASCADE"
             )
         )
@@ -410,10 +411,12 @@ async def run_evaluation() -> dict[str, Any]:
         model=settings.llm_model,
         timeout_seconds=settings.llm_timeout_seconds,
     )
+    outbox_relay = OutboxRelay(session_factory=session_factory, redis_bus=redis_bus)
     consumer = TrajectoryStreamConsumer(
         session_factory=session_factory,
         redis_bus=redis_bus,
         consumer_name="eval-archiver-1",
+        outbox_relay=outbox_relay,
     )
     await consumer.initialize()
 
@@ -425,6 +428,7 @@ async def run_evaluation() -> dict[str, Any]:
         llm_provider=llm_provider,
         step_delay_ms=0,
         trajectory_consumer=consumer,
+        outbox_relay=outbox_relay,
     )
     worker = AgentWorker(orchestrator, worker_id="eval-worker-1", trajectory_consumer=consumer)
 
