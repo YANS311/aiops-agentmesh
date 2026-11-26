@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
@@ -71,7 +72,7 @@ class AgentTask(Base):
     agent_role: Mapped[str] = mapped_column(String(64), nullable=False)
     step_order: Mapped[int] = mapped_column(Integer, nullable=False)
     action_type: Mapped[str] = mapped_column(String(32), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True, default="QUEUED")
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="QUEUED")
     input_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     output_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -87,6 +88,12 @@ class AgentTask(Base):
 
     __table_args__ = (
         Index("ix_agent_tasks_queue_order", "status", "step_order", "created_at"),
+        Index(
+            "ix_agent_tasks_queued_partial",
+            "step_order",
+            "created_at",
+            postgresql_where=text("status = 'QUEUED'"),
+        ),
     )
 
 

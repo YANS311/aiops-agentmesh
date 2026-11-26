@@ -3,6 +3,9 @@
 Strictly enforces LLM_PROVIDER=mock (zero external API calls / zero token cost)
 and executes against real PostgreSQL 16 (FOR UPDATE SKIP LOCKED + JSONB/GIN)
 and real Redis 7 Streams (Consumer Group + XACK).
+
+Uses an event-driven Redis Streams observer (XREADGROUP + XACK) to wait for
+PENDING_APPROVAL and RESOLVED transitions instead of polling PostgreSQL.
 """
 
 from __future__ import annotations
@@ -17,7 +20,6 @@ from pathlib import Path
 import statistics
 import sys
 import time
-from typing import Any
 
 # Hard guard: NEVER call real LLM APIs during load benchmarks.
 os.environ["LLM_PROVIDER"] = "mock"
@@ -36,7 +38,7 @@ from app.agents.tools import ToolRegistry
 from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 from app.config import get_settings
 from app.db.base import init_db
-from app.db.models import AgentTask, Incident, IncidentTrajectory
+from app.db.models import AgentTask, IncidentTrajectory
 from app.redis_bus.events import (
     GLOBAL_EVENTS_STREAM,
     TRAJECTORY_CONSUMER_GROUP,
@@ -49,6 +51,8 @@ FAULT_TYPES = [
     "slow_sql_lock_contention",
     "redis_cache_stampede",
 ]
+
+BENCH_OBSERVER_GROUP = "cg:bench-observer"
 
 
 @dataclass
@@ -74,6 +78,103 @@ class TierBenchmarkResult:
     redis_stream_xpending: int
 
 
+class StreamLifecycleObserver:
+    """Event-driven Redis Streams observer eliminating DB polling during benchmarks."""
+
+    def __init__(self, redis_bus: RedisEventBus) -> None:
+        self.redis_bus = redis_bus
+        self._approval_ready: dict[str, asyncio.Event] = {}
+        self._terminal_ready: dict[str, asyncio.Event] = {}
+        self._terminal_status: dict[str, str] = {}
+        self._stop_event = asyncio.Event()
+        self._task: asyncio.Task[None] | None = None
+
+    def _get_approval_event(self, incident_id: str) -> asyncio.Event:
+        ev = self._approval_ready.get(incident_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._approval_ready[incident_id] = ev
+        return ev
+
+    def _get_terminal_event(self, incident_id: str) -> asyncio.Event:
+        ev = self._terminal_ready.get(incident_id)
+        if ev is None:
+            ev = asyncio.Event()
+            self._terminal_ready[incident_id] = ev
+        return ev
+
+    async def wait_for_approval_required(self, incident_id: str, timeout: float = 45.0) -> bool:
+        ev = self._get_approval_event(incident_id)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            return True
+        except TimeoutError:
+            return False
+
+    async def wait_for_terminal(self, incident_id: str, timeout: float = 45.0) -> str | None:
+        ev = self._get_terminal_event(incident_id)
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=timeout)
+            return self._terminal_status.get(incident_id)
+        except TimeoutError:
+            return None
+
+    async def _loop(self) -> None:
+        await self.redis_bus.ensure_consumer_group(
+            GLOBAL_EVENTS_STREAM, BENCH_OBSERVER_GROUP, start_id="0"
+        )
+        while not self._stop_event.is_set():
+            try:
+                entries = await self.redis_bus.read_group(
+                    GLOBAL_EVENTS_STREAM,
+                    BENCH_OBSERVER_GROUP,
+                    "observer-1",
+                    count=100,
+                    block_ms=100,
+                )
+                if not entries:
+                    continue
+                ack_ids: list[str] = []
+                for entry_id, payload in entries:
+                    inc_id = str(payload.get("incident_id", ""))
+                    ev_type = payload.get("event_type")
+                    if ev_type == "APPROVAL_REQUIRED":
+                        self._get_approval_event(inc_id).set()
+                    elif ev_type == "INCIDENT_RESOLVED":
+                        self._terminal_status[inc_id] = "RESOLVED"
+                        self._get_terminal_event(inc_id).set()
+                    elif ev_type == "APPROVAL_REJECTED":
+                        self._terminal_status[inc_id] = "REJECTED"
+                        self._get_terminal_event(inc_id).set()
+                    elif ev_type == "INCIDENT_FAILED":
+                        self._terminal_status[inc_id] = "FAILED"
+                        self._get_approval_event(inc_id).set()
+                        self._get_terminal_event(inc_id).set()
+                    ack_ids.append(entry_id)
+                if ack_ids:
+                    await self.redis_bus.ack(GLOBAL_EVENTS_STREAM, BENCH_OBSERVER_GROUP, *ack_ids)
+            except asyncio.CancelledError:
+                raise
+
+    async def start(self) -> None:
+        await self.redis_bus.ensure_consumer_group(
+            GLOBAL_EVENTS_STREAM, BENCH_OBSERVER_GROUP, start_id="0"
+        )
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._loop(), name="bench-stream-observer")
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        await self.redis_bus.destroy_consumer_group(GLOBAL_EVENTS_STREAM, BENCH_OBSERVER_GROUP)
+
+
 def percentile(sorted_values: list[float], pct: float) -> float:
     if not sorted_values:
         return 0.0
@@ -93,12 +194,13 @@ async def run_tier(
     settings = get_settings()
     assert settings.llm_provider == "mock", "Benchmark must run with LLM_PROVIDER=mock"
 
+    # asyncpg detects dead connections natively; disabling pool_pre_ping avoids redundant SELECT 1 roundtrips.
     engine = create_async_engine(
         database_url,
         echo=False,
-        pool_pre_ping=True,
-        pool_size=25,
-        max_overflow=35,
+        pool_pre_ping=False,
+        pool_size=30,
+        max_overflow=30,
     )
     session_factory = async_sessionmaker(
         bind=engine,
@@ -106,6 +208,8 @@ async def run_tier(
         expire_on_commit=False,
         autoflush=False,
     )
+    async with engine.begin() as conn:
+        await conn.execute(text("DROP INDEX IF EXISTS ix_agent_tasks_status"))
     await init_db(engine)
 
     # Clean PG16 test database & Redis test DB before each concurrency tier.
@@ -137,6 +241,9 @@ async def run_tier(
     ]
     await archivers[0].initialize()
 
+    observer = StreamLifecycleObserver(redis_bus)
+    await observer.start()
+
     orchestrator = AIOpsOrchestrator(
         session_factory=session_factory,
         redis_bus=redis_bus,
@@ -164,19 +271,9 @@ async def run_tier(
                 fault_type=fault_type,
                 alert_payload={"bench_tier": concurrency, "bench_idx": idx},
             )
-            # Wait until PENDING_APPROVAL
-            deadline = time.perf_counter() + 45.0
-            while time.perf_counter() < deadline:
-                async with session_factory() as sess:
-                    status_now = (
-                        await sess.execute(select(Incident.status).where(Incident.id == inc.id))
-                    ).scalar_one()
-                if status_now == "PENDING_APPROVAL":
-                    break
-                if status_now in {"FAILED", "REJECTED"}:
-                    return False, (time.perf_counter() - t_start) * 1000.0
-                await asyncio.sleep(0.01)
-            else:
+            inc_id = str(inc.id)
+            reached_gate = await observer.wait_for_approval_required(inc_id, timeout=45.0)
+            if not reached_gate:
                 return False, (time.perf_counter() - t_start) * 1000.0
 
             await orchestrator.approve_remediation(
@@ -185,18 +282,8 @@ async def run_tier(
                 comment=f"Auto-approved in concurrency={concurrency} benchmark",
             )
 
-            # Wait until RESOLVED (archived by TrajectoryStreamConsumer via Redis Streams)
-            while time.perf_counter() < deadline:
-                async with session_factory() as sess:
-                    status_now = (
-                        await sess.execute(select(Incident.status).where(Incident.id == inc.id))
-                    ).scalar_one()
-                if status_now == "RESOLVED":
-                    return True, (time.perf_counter() - t_start) * 1000.0
-                if status_now in {"FAILED", "REJECTED"}:
-                    return False, (time.perf_counter() - t_start) * 1000.0
-                await asyncio.sleep(0.01)
-            return False, (time.perf_counter() - t_start) * 1000.0
+            final_status = await observer.wait_for_terminal(inc_id, timeout=45.0)
+            return final_status == "RESOLVED", (time.perf_counter() - t_start) * 1000.0
         except Exception:
             return False, (time.perf_counter() - t_start) * 1000.0
 
@@ -287,6 +374,7 @@ async def run_tier(
 
         return result
     finally:
+        await observer.stop()
         for w in workers:
             await w.stop()
         for arch in archivers:

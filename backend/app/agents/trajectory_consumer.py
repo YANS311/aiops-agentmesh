@@ -1,6 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
+import time
 from typing import Any
 from uuid import UUID
 
@@ -54,13 +55,17 @@ class TrajectoryStreamConsumer:
         self.consumer_name = consumer_name
         self.group_name = group_name
         self.stream_key = stream_key
+        self._initialized = False
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
     async def initialize(self) -> None:
+        if self._initialized:
+            return
         await self.redis_bus.ensure_consumer_group(
             self.stream_key, self.group_name, start_id="0"
         )
+        self._initialized = True
 
     async def _handle_entry(self, entry_id: str, event_payload: dict[str, Any]) -> None:
         event_type = event_payload.get("event_type")
@@ -259,14 +264,14 @@ class TrajectoryStreamConsumer:
 
     async def _loop(self) -> None:
         await self.initialize()
-        reclaim_tick = 0
+        last_reclaim = time.monotonic()
         while not self._stop_event.is_set():
             try:
-                processed = await self.process_batch(block_ms=250, count=20)
-                reclaim_tick += 1
-                if reclaim_tick >= 20 or processed == 0:
+                await self.process_batch(block_ms=100, count=50)
+                now = time.monotonic()
+                if now - last_reclaim >= 5.0:
                     await self.reclaim_and_process_pending(min_idle_ms=5000, count=20)
-                    reclaim_tick = 0
+                    last_reclaim = now
             except asyncio.CancelledError:
                 raise
             except Exception:

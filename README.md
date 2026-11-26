@@ -48,10 +48,10 @@ cd backend
 
 ## Concurrency & Reliability Benchmark (Local PG16 + Redis 7, `LLM_PROVIDER=mock`)
 
-Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md) (4 concurrent `SKIP LOCKED` Workers + 2 Redis Stream Archivers):
+Full root-cause analysis & report: [docs/BENCHMARK.md](docs/BENCHMARK.md) (4 concurrent `SKIP LOCKED` Workers + 2 Redis Stream Archivers):
 
-| Concurrency | Total Requests | Success Rate | Avg Latency (ms) | P95 Latency (ms) | P99 Latency (ms) | Throughput (req/s) | Duplicate Tasks | Redis `XPENDING` |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| 10 | 10 | 100.00% | 1769.83 | 1953.89 | 1953.89 | 5.02 | **0** | **0** |
-| 30 | 30 | 100.00% | 8599.00 | 9176.27 | 9237.87 | 3.22 | **0** | **0** |
-| 50 | 50 | 100.00% | 19938.53 | 21108.72 | 21158.80 | 2.35 | **0** | **0** |
+| Concurrency | Baseline Req/s | Optimized Req/s | Throughput Gain | Baseline P99 (ms) | Optimized P99 (ms) | P99 Reduction | Success | DupTasks | Redis `XPENDING` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **10** | 5.02 | **7.15** | **1.42x (+42.4%)** | 1,953.89 | **1,347.68** | **-31.0%** | 100.00% | **0** | **0** |
+| **30** | 3.22 | **8.20** | **2.55x (+154.7%)** | 9,237.87 | **3,574.30** | **-61.3%** | 100.00% | **0** | **0** |
+| **50** | 2.35 | **8.57** | **3.65x (+264.7%)** | 21,158.80 | **5,685.34** | **-73.1%** | 100.00% | **0** | **0** |

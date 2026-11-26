@@ -87,10 +87,17 @@ class AIOpsOrchestrator:
         self.llm = llm_provider
         self.step_delay_ms = step_delay_ms
         self.trajectory_consumer = trajectory_consumer
-        self._wakeup_event = asyncio.Event()
+        self._worker_wakeups: set[asyncio.Event] = set()
+
+    def register_worker_wakeup(self, ev: asyncio.Event) -> None:
+        self._worker_wakeups.add(ev)
+
+    def unregister_worker_wakeup(self, ev: asyncio.Event) -> None:
+        self._worker_wakeups.discard(ev)
 
     def notify_worker(self) -> None:
-        self._wakeup_event.set()
+        for ev in tuple(self._worker_wakeups):
+            ev.set()
 
     async def _publish_pending(
         self, incident_id: UUID, events: list[TraceEvent], blackboard: dict[str, Any] | None = None
@@ -841,6 +848,7 @@ class AgentWorker:
         self.worker_id = worker_id
         self.trajectory_consumer = trajectory_consumer
         self._stop_event = asyncio.Event()
+        self._wakeup_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
     async def run_until_quiescent(self, max_steps: int = 25) -> int:
@@ -858,21 +866,25 @@ class AgentWorker:
         return processed
 
     async def _loop(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                did_work = await self.orchestrator.process_one_task(self.worker_id)
-                if did_work:
-                    continue
-            except Exception:
-                logger.exception("Unhandled error in AgentWorker loop")
+        self.orchestrator.register_worker_wakeup(self._wakeup_event)
+        try:
+            while not self._stop_event.is_set():
+                self._wakeup_event.clear()
+                try:
+                    did_work = await self.orchestrator.process_one_task(self.worker_id)
+                    if did_work:
+                        continue
+                except Exception:
+                    logger.exception("Unhandled error in AgentWorker loop")
 
-            self.orchestrator._wakeup_event.clear()
-            if self._stop_event.is_set():
-                break
-            try:
-                await asyncio.wait_for(self.orchestrator._wakeup_event.wait(), timeout=0.5)
-            except TimeoutError:
-                pass
+                if self._stop_event.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(self._wakeup_event.wait(), timeout=0.2)
+                except TimeoutError:
+                    pass
+        finally:
+            self.orchestrator.unregister_worker_wakeup(self._wakeup_event)
 
     def start(self) -> None:
         if self._task is None:
@@ -881,6 +893,7 @@ class AgentWorker:
 
     async def stop(self) -> None:
         self._stop_event.set()
+        self._wakeup_event.set()
         self.orchestrator.notify_worker()
         if self._task is not None:
             await self._task
