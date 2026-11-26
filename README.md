@@ -40,4 +40,18 @@ cd backend
 # 4. Start Frontend Console (new terminal)
 cd frontend
 npm run dev
+
+# 5. Run Concurrency & Reliability Load Benchmark (LLM_PROVIDER=mock, real PG16 + Redis 7)
+cd backend
+.\.venv\Scripts\python.exe benchmarks\run_load_benchmark.py --tiers 10 30 50 --workers 4 --archivers 2
 ```
+
+## Concurrency & Reliability Benchmark (Local PG16 + Redis 7, `LLM_PROVIDER=mock`)
+
+Full report: [docs/BENCHMARK.md](docs/BENCHMARK.md) (4 concurrent `SKIP LOCKED` Workers + 2 Redis Stream Archivers):
+
+| Concurrency | Total Requests | Success Rate | Avg Latency (ms) | P95 Latency (ms) | P99 Latency (ms) | Throughput (req/s) | Duplicate Tasks | Redis `XPENDING` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 10 | 10 | 100.00% | 1769.83 | 1953.89 | 1953.89 | 5.02 | **0** | **0** |
+| 30 | 30 | 100.00% | 8599.00 | 9176.27 | 9237.87 | 3.22 | **0** | **0** |
+| 50 | 50 | 100.00% | 19938.53 | 21108.72 | 21158.80 | 2.35 | **0** | **0** |
