@@ -223,7 +223,7 @@ export default function App() {
                 AgentMesh AIOps Control Plane
               </h1>
               <p className="text-xs text-slate-400">
-                Multi-Agent Incident Triage • PG16 SKIP LOCKED • Fail-Closed Human Gate
+                PG16 SKIP LOCKED • Redis Streams (Consumer Group + ACK) • Fail-Closed Human Gate
               </p>
             </div>
           </div>

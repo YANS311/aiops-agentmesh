@@ -4,17 +4,18 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
 
 ## Architecture Highlights (Phase 1)
 
-- **PostgreSQL 16 Persistence & Queueing**:
+- **PostgreSQL 16 Transactional Task Dispatch**:
   - `JSONB` columns (`alert_payload`, `blackboard`, `trace_events.payload`, `trajectory_doc`) backed by `GIN` indexes.
   - Concurrent task queue claimed atomically via `SELECT ... FOR UPDATE SKIP LOCKED`.
+- **Redis 7 Streams (Consumer Group + `XACK` + `XAUTOCLAIM`)**:
+  - **Real-Time Incident Event Stream** (`stream:incident:{id}:events`): SSE subscribers create an ephemeral consumer group (`cg:sse:*`), read via `XREADGROUP`, deduplicate against PG16 `trace_events.id`, call `XACK` on each frame, and clean up via `XGROUP DESTROY`.
+  - **Trajectory Archival Consumer** (`stream:aiops:events` + `cg:trajectory-archiver`): consumes `HIGH_RISK_EXECUTED` events, archives `IncidentTrajectory` and transitions `Incident` to `RESOLVED` in PG16, calls `XACK` only after PG16 commit, and recovers unacknowledged PEL entries via `XAUTOCLAIM`.
 - **Hermes-Inspired Extensions**:
   - **Declarative Runbook Skills** (`backend/skills/*.yaml`): SOP definitions mapping fault types to `READ_ONLY` diagnostic tools and `HIGH_RISK_WRITE` remediations.
-  - **Trajectory Archival** (`incident_trajectories`): Post-resolution structured JSONB archive of evidence, approval audit, execution output, and trace timeline.
+  - **Trajectory Archival** (`incident_trajectories`): Post-resolution structured JSONB archive of evidence, approval audit, execution output, `stream_consumption` metadata, and trace timeline.
 - **Fail-Closed Human Approval Gate (`PolicyGuard`)**:
   - `READ_ONLY` diagnostic agents (`LOG_DIAGNOSTICS`, `DB_DIAGNOSTICS`) execute automatically.
   - `HIGH_RISK_WRITE` operations always suspend in `PENDING_APPROVAL`; direct `/execute` without an `APPROVED` record returns HTTP `403` (`APPROVAL_REQUIRED_FAIL_CLOSED`) and records an audit trace event.
-- **Race-Free Live SSE Streaming**:
-  - Subscribes to Redis Pub/Sub (`incident:{id}:events`) prior to reading PG16 `trace_events` history, deduplicating by monotonic `trace_events.id` and terminating cleanly on `event: complete`.
 
 ## Local Services & Ports
 

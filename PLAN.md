@@ -3,7 +3,7 @@
 ## 1. Architecture & Locked Tech Stack
 
 - **Repository**: Standalone Git repository at `d:\Projects\aiops-agentmesh` (`main` branch).
-- **Backend**: Python 3.12 + FastAPI + SQLAlchemy 2.0 (async `asyncpg`) + PostgreSQL 16 + Redis 7 (`redis.asyncio`).
+- **Backend**: Python 3.12 + FastAPI + SQLAlchemy 2.0 (async `asyncpg`) + PostgreSQL 16 (`FOR UPDATE SKIP LOCKED` task dispatch) + Redis 7 Streams (`XADD` / `XREADGROUP` / `XACK` / `XAUTOCLAIM` for real-time events and trajectory consumption).
 - **Frontend**: Vite + React + TypeScript + Tailwind CSS (`@tailwindcss/vite`).
 - **Design Influences (from Hermes Agent, adapted to distributed control plane)**:
   1. **Declarative Runbook Skills (`backend/skills/*.yaml`)**: SOPs defining fault signatures, read-only diagnostic tools, and guarded remediation actions.
