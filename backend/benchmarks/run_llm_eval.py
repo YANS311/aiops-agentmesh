@@ -343,14 +343,19 @@ class CaseEvalOutcome:
     case_id: str
     category: str
     fault_type: str
+    expected_outcome: str
     pre_approval_status: str
+    actual_final_status: str
+    pydantic_passed: bool
     fail_closed_verified: bool
     fail_closed_mechanism: str
     root_cause_hit: bool | None
-    final_status: str
     trajectory_archived: bool
+    end_to_end_latency_ms: float
     llm_calls: int
-    case_tokens: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
     notes: str = ""
 
 
@@ -431,6 +436,7 @@ async def run_evaluation() -> dict[str, Any]:
         for idx, case in enumerate(EVAL_CASES, start=1):
             llm_provider.current_case_id = case.case_id
             before_metric_idx = len(llm_provider.metrics)
+            case_t0 = time.perf_counter()
             print(f"[Eval {idx:02d}/{len(EVAL_CASES)}] Running {case.case_id} ({case.category})...")
 
             inc = await orchestrator.inject_incident(
@@ -523,19 +529,35 @@ async def run_evaluation() -> dict[str, Any]:
                     notes = "Fail-Closed on malformed LLM output."
 
             case_metrics = llm_provider.metrics[before_metric_idx:]
+            case_elapsed_ms = round((time.perf_counter() - case_t0) * 1000.0, 2)
+            case_pydantic_ok = all(m.passed_pydantic for m in case_metrics)
+            expected_outcome = (
+                "FAILED (No Skill Fail-Closed)"
+                if case.expect_unknown_skill_fail_closed
+                else (
+                    "PENDING_APPROVAL -> 403 Block -> Approve -> RESOLVED"
+                    if case.approve_after_gate_check
+                    else "Fail-Closed Block (PENDING_APPROVAL + 403 or POLICY_VIOLATION_BLOCKED)"
+                )
+            )
             outcomes.append(
                 CaseEvalOutcome(
                     case_id=case.case_id,
                     category=case.category,
                     fault_type=case.fault_type,
+                    expected_outcome=expected_outcome,
                     pre_approval_status=mid.status,
+                    actual_final_status=final_status,
+                    pydantic_passed=case_pydantic_ok,
                     fail_closed_verified=fail_closed_verified,
                     fail_closed_mechanism=fail_closed_mechanism,
                     root_cause_hit=root_cause_hit,
-                    final_status=final_status,
                     trajectory_archived=trajectory_archived,
+                    end_to_end_latency_ms=case_elapsed_ms,
                     llm_calls=len(case_metrics),
-                    case_tokens=sum(m.total_tokens for m in case_metrics),
+                    prompt_tokens=sum(m.prompt_tokens for m in case_metrics),
+                    completion_tokens=sum(m.completion_tokens for m in case_metrics),
+                    total_tokens=sum(m.total_tokens for m in case_metrics),
                     notes=notes,
                 )
             )
@@ -602,6 +624,10 @@ async def run_evaluation() -> dict[str, Any]:
 
 def main() -> None:
     report = asyncio.run(run_evaluation())
+    out_json = BACKEND_ROOT.parent / "docs" / "eval_results_deepseek.json"
+    out_json.parent.mkdir(parents=True, exist_ok=True)
+    out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
     print("\n================ DeepSeek Adversarial & Fault-Injection Eval Summary ================")
     print(f"Model / Provider        : {report['model']} ({report['provider']})")
     print(
@@ -629,8 +655,8 @@ def main() -> None:
         f"(prompt={report['prompt_tokens']}, completion={report['completion_tokens']})"
     )
     print(f"Redis Stream XPENDING   : {report['redis_stream_xpending']}")
+    print(f"Exported JSON Report    : {out_json}")
     print("=====================================================================================\n")
-    print(json.dumps(report["outcomes"], ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

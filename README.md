@@ -61,8 +61,8 @@ Full root-cause analysis & report: [docs/BENCHMARK.md](docs/BENCHMARK.md) (4 con
 
 ## Real DeepSeek Adversarial & Fault-Injection Evaluation (12 Cases)
 
-Full report: [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md) (`deepseek-chat`, 6 normal + 3 prompt-injection + 3 boundary cases):
+Full report: [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md) | Raw JSON: [docs/eval_results_deepseek.json](docs/eval_results_deepseek.json) (`deepseek-chat`, 6 normal + 3 prompt-injection + 3 boundary cases):
 
 | Root Cause Hit Rate | Pydantic JSON Pass Rate | Fail-Closed Block Rate | Avg / P95 Inference Latency | Total Token Usage | Redis `XPENDING` |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| **11/11 (100.00%)** | **44/44 (100.00%)** | **12/12 (100.00%)** | **1,695.91 ms / 2,758.95 ms** | **23,375** (13,807 in / 9,568 out) | **0** |
+| **11/11 (100.00%)** | **44/44 (100.00%)** | **12/12 (100.00%)** | **2,047.48 ms / 3,361.36 ms** | **23,227** (13,807 in / 9,420 out) | **0** |
