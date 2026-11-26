@@ -1,6 +1,10 @@
 # AgentMesh AIOps Control Plane
 
+[![CI](https://img.shields.io/badge/CI-GitHub%20Actions%20(PG16%20%2B%20Redis%207%20%2B%20Node%2020)-2088FF?logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
+
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
+
+> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 25-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
 
 ## Architecture Highlights
 
