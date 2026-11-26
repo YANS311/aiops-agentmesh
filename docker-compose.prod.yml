@@ -1,0 +1,62 @@
+name: aiops-agentmesh-prod
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: aiops
+      POSTGRES_PASSWORD: aiops_prod_pwd
+      POSTGRES_DB: aiops_mesh
+    volumes:
+      - pg16_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiops -d aiops_mesh"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql+asyncpg://aiops:aiops_prod_pwd@postgres:5432/aiops_mesh
+      REDIS_URL: redis://redis:6379/0
+      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
+      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      AUTO_INIT_DB: "false"
+      RBAC_VIEWER_TOKEN: ${RBAC_VIEWER_TOKEN:-viewer-demo-token}
+      RBAC_APPROVER_TOKEN: ${RBAC_APPROVER_TOKEN:-sre-approver-demo-token}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8016/api/v1/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  frontend-nginx:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "127.0.0.1:8088:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  pg16_prod_data:

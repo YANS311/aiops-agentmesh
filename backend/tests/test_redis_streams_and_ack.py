@@ -161,6 +161,7 @@ async def test_sse_consumer_group_acks_and_destroys_ephemeral_group(
                 await asyncio.sleep(0.15)
                 resp = await client.post(
                     f"/api/v1/incidents/{incident_id}/approve",
+                    headers={"Authorization": f"Bearer {settings.rbac_approver_token}"},
                     json={"operator": "sre-sse-ack"},
                 )
                 assert resp.status_code == 200

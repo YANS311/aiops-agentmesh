@@ -12,7 +12,9 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
+  ROLE_TOKENS,
   approveIncident,
+  fetchCurrentActor,
   fetchHealth,
   fetchIncidentDetail,
   fetchIncidents,
@@ -21,9 +23,11 @@ import {
   rejectIncident,
 } from './api';
 import type {
+  ActorInfo,
   HealthResponse,
   IncidentDetail,
   IncidentSummary,
+  RoleType,
   SkillOut,
   TraceEvent,
 } from './types';
@@ -60,10 +64,13 @@ export default function App() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [detail, setDetail] = useState<IncidentDetail | null>(null);
   const [traces, setTraces] = useState<TraceEvent[]>([]);
-  const [operatorName, setOperatorName] = useState<string>('sre-oncall');
+  const [operatorName, setOperatorName] = useState<string>('sre-lead-01');
   const [approvalComment, setApprovalComment] = useState<string>(
     '已核对只读诊断证据，确认安全并放行执行。'
   );
+  const [activeRole, setActiveRole] = useState<RoleType>('VIEWER');
+  const [actorInfo, setActorInfo] = useState<ActorInfo | null>(null);
+  const [rbacBanner, setRbacBanner] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<boolean>(false);
   const [uiError, setUiError] = useState<string | null>(null);
 
@@ -106,6 +113,26 @@ export default function App() {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    const token = ROLE_TOKENS[activeRole];
+    void fetchCurrentActor(token)
+      .then((info) => {
+        if (!active) return;
+        setActorInfo(info);
+        setOperatorName(info.actor_id);
+        setRbacBanner(null);
+      })
+      .catch((err) => {
+        if (active) {
+          setUiError(err instanceof Error ? err.message : String(err));
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, [activeRole]);
 
   useEffect(() => {
     if (!selectedId) {
@@ -170,12 +197,20 @@ export default function App() {
 
   const handleApprove = async () => {
     if (!selectedId) return;
-    setBusyAction(true);
     setUiError(null);
+    if (activeRole !== 'SRE_APPROVER') {
+      setRbacBanner(
+        `权限不足（RBAC 拦截）：当前身份 ${actorInfo?.actor_id ?? 'viewer-demo-01'} (VIEWER) 无权执行高危审批，请先在顶栏切换为 SRE_APPROVER。`
+      );
+      return;
+    }
+    setRbacBanner(null);
+    setBusyAction(true);
     try {
       const updated = await approveIncident(
         selectedId,
-        operatorName.trim() || 'sre-oncall',
+        actorInfo?.actor_id ?? operatorName,
+        ROLE_TOKENS[activeRole],
         approvalComment.trim() || undefined
       );
       setDetail(updated);
@@ -189,13 +224,21 @@ export default function App() {
 
   const handleReject = async () => {
     if (!selectedId) return;
-    setBusyAction(true);
     setUiError(null);
+    if (activeRole !== 'SRE_APPROVER') {
+      setRbacBanner(
+        `权限不足（RBAC 拦截）：当前身份 ${actorInfo?.actor_id ?? 'viewer-demo-01'} (VIEWER) 无权拒绝高危审批，请先在顶栏切换为 SRE_APPROVER。`
+      );
+      return;
+    }
+    setRbacBanner(null);
+    setBusyAction(true);
     try {
       const updated = await rejectIncident(
         selectedId,
-        operatorName.trim() || 'sre-oncall',
-        'Aborted by human operator'
+        actorInfo?.actor_id ?? operatorName,
+        ROLE_TOKENS[activeRole],
+        '已由人工操作员拒绝执行'
       );
       setDetail(updated);
       await refreshListAndDetail(selectedId);
@@ -229,6 +272,37 @@ export default function App() {
           </div>
 
           <div className="flex flex-wrap items-center gap-3">
+            {/* RBAC Role Switcher */}
+            <div
+              data-testid="rbac-role-switcher"
+              className="flex items-center rounded-lg bg-slate-800 border border-slate-700 p-0.5 text-xs"
+            >
+              <button
+                type="button"
+                data-testid="role-viewer-btn"
+                onClick={() => setActiveRole('VIEWER')}
+                className={`px-2.5 py-1 rounded-md font-medium transition cursor-pointer ${
+                  activeRole === 'VIEWER'
+                    ? 'bg-amber-500/25 text-amber-200 border border-amber-400/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                VIEWER
+              </button>
+              <button
+                type="button"
+                data-testid="role-approver-btn"
+                onClick={() => setActiveRole('SRE_APPROVER')}
+                className={`px-2.5 py-1 rounded-md font-medium transition cursor-pointer ${
+                  activeRole === 'SRE_APPROVER'
+                    ? 'bg-emerald-500/25 text-emerald-200 border border-emerald-400/40'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                SRE_APPROVER
+              </button>
+            </div>
+
             <div
               data-testid="health-badge"
               className="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-medium bg-slate-800 border border-slate-700"
@@ -461,6 +535,15 @@ export default function App() {
                       拒绝执行
                     </button>
                   </div>
+
+                  {rbacBanner && (
+                    <div
+                      data-testid="rbac-denied-banner"
+                      className="mt-3 rounded-lg border border-rose-500/50 bg-rose-950/40 px-3.5 py-2.5 text-xs text-rose-200"
+                    >
+                      {rbacBanner}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -546,8 +629,11 @@ export default function App() {
                     </div>
                     <div className="text-xs text-slate-300">
                       <strong>审批人：</strong>{' '}
-                      {detail.approval?.approved_by ?? 'N/A'} |{' '}
-                      <strong>执行命令：</strong>{' '}
+                      {detail.approval?.approved_by ?? 'N/A'}
+                      {detail.approval?.approved_by_role
+                        ? ` (${detail.approval.approved_by_role})`
+                        : ''}{' '}
+                      | <strong>执行命令：</strong>{' '}
                       <code className="text-emerald-300">{detail.trajectory.resolution_command}</code>
                     </div>
                     <pre className="text-[11px] font-mono bg-slate-950 border border-slate-800 rounded p-2.5 overflow-x-auto text-slate-300 max-h-48">

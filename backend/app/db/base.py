@@ -36,6 +36,7 @@ _IDEMPOTENT_MIGRATIONS: list[str] = [
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS max_attempts INTEGER NOT NULL DEFAULT 3",
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(128)",
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
+    "ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS approved_by_role VARCHAR(32)",
     "DROP INDEX IF EXISTS ix_agent_tasks_status",
     (
         "CREATE INDEX IF NOT EXISTS ix_agent_tasks_queued_partial "

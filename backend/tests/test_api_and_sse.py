@@ -58,8 +58,12 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
             assert detail["status"] == "PENDING_APPROVAL"
             assert detail["approval"]["status"] == "PENDING"
 
-            # 3. Attempt unauthorized /execute -> MUST return 403 Fail-Closed
-            exec_resp = await client.post(f"/api/v1/incidents/{incident_id}/execute")
+            # 3. Attempt unauthorized /execute (authenticated SRE_APPROVER, but approval still PENDING) -> MUST return 403 Fail-Closed
+            approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
+            exec_resp = await client.post(
+                f"/api/v1/incidents/{incident_id}/execute",
+                headers=approver_headers,
+            )
             assert exec_resp.status_code == 403
             assert exec_resp.json()["detail"]["code"] == "APPROVAL_REQUIRED_FAIL_CLOSED"
 
@@ -70,6 +74,7 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
                 await asyncio.sleep(0.15)
                 app_resp = await client.post(
                     f"/api/v1/incidents/{incident_id}/approve",
+                    headers=approver_headers,
                     json={"operator": "sre-api-test", "comment": "LGTM"},
                 )
                 assert app_resp.status_code == 200

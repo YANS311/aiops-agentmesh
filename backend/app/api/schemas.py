@@ -11,6 +11,11 @@ class HealthResponse(BaseModel):
     redis: str
 
 
+class ActorOut(BaseModel):
+    actor_id: str
+    role: str
+
+
 class SkillOut(BaseModel):
     skill_id: str
     fault_type: str
@@ -70,6 +75,7 @@ class ApprovalOut(BaseModel):
     action_plan: dict[str, Any]
     status: str
     approved_by: str | None
+    approved_by_role: str | None
     approval_comment: str | None
     decided_at: datetime | None
     executed_at: datetime | None

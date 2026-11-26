@@ -2,16 +2,17 @@ import asyncio
 from contextlib import suppress
 from datetime import datetime, timezone
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from redis.exceptions import RedisError
-
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.agents.llm import LLMProvider, MalformedLLMOutputError
+from app.agents.reliability import OutboxRelay
 from app.agents.tools import (
     ApprovalRequiredError,
     PolicyGuard,
@@ -24,7 +25,6 @@ from app.db.models import (
     RemediationApproval,
     TraceEvent,
 )
-from app.agents.reliability import OutboxRelay
 from app.db.repositories import (
     DEFAULT_LEASE_SECONDS,
     append_trace_event,
@@ -34,6 +34,8 @@ from app.db.repositories import (
     renew_task_lease,
     serialize_trace_event,
 )
+from app.observability.logging import bind_log_context
+from app.observability.metrics import FAIL_CLOSED_BLOCKS_TOTAL, TASK_DURATION_SECONDS
 from app.redis_bus.events import RedisEventBus
 from app.skills.loader import SkillRegistry
 
@@ -259,6 +261,9 @@ class AIOpsOrchestrator:
         pending_events: list[TraceEvent] = []
         blackboard_snapshot: dict[str, Any] | None = None
         enqueued_more = False
+        exec_started = time.perf_counter()
+        metric_role = "UNKNOWN"
+        metric_status = "FAILED"
 
         async with self.session_factory() as session:
             async with session.begin():
@@ -279,80 +284,90 @@ class AIOpsOrchestrator:
                     return False
                 incident_id = task.incident_id
                 agent_role = task.agent_role
+                metric_role = agent_role
                 incident = (
                     await session.execute(
                         select(Incident).where(Incident.id == incident_id).with_for_update()
                     )
                 ).scalar_one()
 
-                try:
-                    if agent_role == "COORDINATOR":
-                        enqueued_more = await self._handle_coordinator(
-                            session, incident, task, pending_events
-                        )
-                    elif agent_role in {"LOG_DIAGNOSTICS", "DB_DIAGNOSTICS"}:
-                        enqueued_more = await self._handle_diagnostic_agent(
-                            session, incident, task, pending_events
-                        )
-                    elif agent_role == "REMEDIATION":
-                        await self._handle_remediation_agent(
-                            session, incident, task, pending_events
-                        )
-                    elif agent_role == "EXECUTOR":
-                        approval = await get_approval_for_update(session, incident.id)
-                        await self._execute_approved_remediation(
-                            session, incident, task, approval, pending_events
-                        )
-                    else:
-                        raise RuntimeError(f"Unsupported agent_role: {agent_role}")
+                with bind_log_context(incident_id=str(incident_id), task_id=str(task_id)):
+                    try:
+                        if agent_role == "COORDINATOR":
+                            enqueued_more = await self._handle_coordinator(
+                                session, incident, task, pending_events
+                            )
+                        elif agent_role in {"LOG_DIAGNOSTICS", "DB_DIAGNOSTICS"}:
+                            enqueued_more = await self._handle_diagnostic_agent(
+                                session, incident, task, pending_events
+                            )
+                        elif agent_role == "REMEDIATION":
+                            await self._handle_remediation_agent(
+                                session, incident, task, pending_events
+                            )
+                        elif agent_role == "EXECUTOR":
+                            approval = await get_approval_for_update(session, incident.id)
+                            await self._execute_approved_remediation(
+                                session, incident, task, approval, pending_events
+                            )
+                        else:
+                            raise RuntimeError(f"Unsupported agent_role: {agent_role}")
 
-                    blackboard_snapshot = dict(incident.blackboard or {})
-                except (PolicyViolationError, ApprovalRequiredError, MalformedLLMOutputError) as exc:
-                    now = datetime.now(timezone.utc)
-                    task.status = "FAILED"
-                    task.error_message = str(exc)
-                    task.completed_at = now
-                    incident.status = "FAILED"
-                    incident.version += 1
+                        metric_status = task.status
+                        blackboard_snapshot = dict(incident.blackboard or {})
+                        logger.info("Completed agent task role=%s status=%s", agent_role, task.status)
+                    except (PolicyViolationError, ApprovalRequiredError, MalformedLLMOutputError) as exc:
+                        now = datetime.now(timezone.utc)
+                        task.status = "FAILED"
+                        task.error_message = str(exc)
+                        task.completed_at = now
+                        incident.status = "FAILED"
+                        incident.version += 1
+                        metric_status = "FAILED"
 
-                    ev_type = (
-                        "POLICY_VIOLATION_BLOCKED"
-                        if isinstance(exc, (PolicyViolationError, ApprovalRequiredError))
-                        else "INCIDENT_FAILED"
-                    )
-                    risk_tier = (
-                        "HIGH_RISK_WRITE"
-                        if isinstance(exc, (PolicyViolationError, ApprovalRequiredError))
-                        else "NONE"
-                    )
-                    pending_events.append(
-                        await append_trace_event(
-                            session,
-                            incident_id=incident.id,
-                            agent_role=agent_role,
-                            event_type=ev_type,
-                            risk_tier=risk_tier,
-                            summary=str(exc),
-                            payload={"task_id": str(task.id), "error": str(exc)},
+                        ev_type = (
+                            "POLICY_VIOLATION_BLOCKED"
+                            if isinstance(exc, (PolicyViolationError, ApprovalRequiredError))
+                            else "INCIDENT_FAILED"
                         )
-                    )
-                    if ev_type != "INCIDENT_FAILED":
+                        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason=ev_type).inc()
+                        risk_tier = (
+                            "HIGH_RISK_WRITE"
+                            if isinstance(exc, (PolicyViolationError, ApprovalRequiredError))
+                            else "NONE"
+                        )
                         pending_events.append(
                             await append_trace_event(
                                 session,
                                 incident_id=incident.id,
-                                agent_role="SYSTEM",
-                                event_type="INCIDENT_FAILED",
+                                agent_role=agent_role,
+                                event_type=ev_type,
                                 risk_tier=risk_tier,
-                                summary=f"Incident terminated Fail-Closed due to {ev_type}",
-                                payload={"reason": str(exc)},
+                                summary=str(exc),
+                                payload={"task_id": str(task.id), "error": str(exc)},
                             )
                         )
-                    blackboard_snapshot = dict(incident.blackboard or {})
+                        if ev_type != "INCIDENT_FAILED":
+                            pending_events.append(
+                                await append_trace_event(
+                                    session,
+                                    incident_id=incident.id,
+                                    agent_role="SYSTEM",
+                                    event_type="INCIDENT_FAILED",
+                                    risk_tier=risk_tier,
+                                    summary=f"Incident terminated Fail-Closed due to {ev_type}",
+                                    payload={"reason": str(exc)},
+                                )
+                            )
+                        blackboard_snapshot = dict(incident.blackboard or {})
+                        logger.warning("Agent task failed closed role=%s reason=%s", agent_role, ev_type)
 
                 if task.status != "RUNNING":
                     task.lease_expires_at = None
 
+        TASK_DURATION_SECONDS.labels(agent_role=metric_role, status=metric_status).observe(
+            time.perf_counter() - exec_started
+        )
         await self._publish_pending(incident_id, pending_events, blackboard_snapshot)
         if enqueued_more:
             self.notify_worker()
@@ -690,68 +705,78 @@ class AIOpsOrchestrator:
         incident_id: UUID,
         *,
         approved_by: str,
+        approved_by_role: str = "SRE_APPROVER",
         comment: str | None = None,
     ) -> Incident:
         pending_events: list[TraceEvent] = []
-        async with self.session_factory() as session:
-            async with session.begin():
-                incident = (
-                    await session.execute(
-                        select(Incident).where(Incident.id == incident_id).with_for_update()
+        with bind_log_context(
+            incident_id=str(incident_id),
+            actor_id=approved_by,
+            actor_role=approved_by_role,
+        ):
+            async with self.session_factory() as session:
+                async with session.begin():
+                    incident = (
+                        await session.execute(
+                            select(Incident).where(Incident.id == incident_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if incident is None:
+                        raise IncidentNotFoundError(f"Incident {incident_id} not found")
+
+                    approval = await get_approval_for_update(session, incident_id)
+                    if (
+                        incident.status != "PENDING_APPROVAL"
+                        or approval is None
+                        or approval.status != "PENDING"
+                    ):
+                        raise ConflictStateError(
+                            f"Cannot approve incident in status={incident.status}, "
+                            f"approval_status={approval.status if approval else 'NONE'}"
+                        )
+
+                    now = datetime.now(timezone.utc)
+                    approval.status = "APPROVED"
+                    approval.approved_by = approved_by
+                    approval.approved_by_role = approved_by_role
+                    approval.approval_comment = comment
+                    approval.decided_at = now
+
+                    incident.status = "EXECUTING_REMEDIATION"
+                    bb = dict(incident.blackboard or {})
+                    bb["stage"] = "EXECUTING_REMEDIATION"
+                    incident.blackboard = bb
+                    flag_modified(incident, "blackboard")
+                    incident.version += 1
+
+                    exec_task = (
+                        await session.execute(
+                            select(AgentTask)
+                            .where(AgentTask.id == approval.task_id)
+                            .with_for_update()
+                        )
+                    ).scalar_one()
+                    exec_task.status = "QUEUED"
+
+                    pending_events.append(
+                        await append_trace_event(
+                            session,
+                            incident_id=incident.id,
+                            agent_role="HUMAN_OPERATOR",
+                            event_type="APPROVAL_GRANTED",
+                            risk_tier="HIGH_RISK_WRITE",
+                            summary=f"Operator {approved_by} ({approved_by_role}) approved high-risk remediation execution.",
+                            payload={
+                                "actor_id": approved_by,
+                                "actor_role": approved_by_role,
+                                "approved_by": approved_by,
+                                "comment": comment or "",
+                                "approval_id": str(approval.id),
+                            },
+                        )
                     )
-                ).scalar_one_or_none()
-                if incident is None:
-                    raise IncidentNotFoundError(f"Incident {incident_id} not found")
-
-                approval = await get_approval_for_update(session, incident_id)
-                if (
-                    incident.status != "PENDING_APPROVAL"
-                    or approval is None
-                    or approval.status != "PENDING"
-                ):
-                    raise ConflictStateError(
-                        f"Cannot approve incident in status={incident.status}, "
-                        f"approval_status={approval.status if approval else 'NONE'}"
-                    )
-
-                now = datetime.now(timezone.utc)
-                approval.status = "APPROVED"
-                approval.approved_by = approved_by
-                approval.approval_comment = comment
-                approval.decided_at = now
-
-                incident.status = "EXECUTING_REMEDIATION"
-                bb = dict(incident.blackboard or {})
-                bb["stage"] = "EXECUTING_REMEDIATION"
-                incident.blackboard = bb
-                flag_modified(incident, "blackboard")
-                incident.version += 1
-
-                exec_task = (
-                    await session.execute(
-                        select(AgentTask)
-                        .where(AgentTask.id == approval.task_id)
-                        .with_for_update()
-                    )
-                ).scalar_one()
-                exec_task.status = "QUEUED"
-
-                pending_events.append(
-                    await append_trace_event(
-                        session,
-                        incident_id=incident.id,
-                        agent_role="HUMAN_OPERATOR",
-                        event_type="APPROVAL_GRANTED",
-                        risk_tier="HIGH_RISK_WRITE",
-                        summary=f"Operator {approved_by} approved high-risk remediation execution.",
-                        payload={
-                            "approved_by": approved_by,
-                            "comment": comment or "",
-                            "approval_id": str(approval.id),
-                        },
-                    )
-                )
-                blackboard_copy = dict(incident.blackboard)
+                    blackboard_copy = dict(incident.blackboard)
+            logger.info("Remediation approved by %s (%s)", approved_by, approved_by_role)
 
         await self._publish_pending(incident_id, pending_events, blackboard_copy)
         self.notify_worker()
@@ -765,123 +790,50 @@ class AIOpsOrchestrator:
         incident_id: UUID,
         *,
         rejected_by: str,
+        rejected_by_role: str = "SRE_APPROVER",
         comment: str | None = None,
     ) -> Incident:
         pending_events: list[TraceEvent] = []
-        async with self.session_factory() as session:
-            async with session.begin():
-                incident = (
-                    await session.execute(
-                        select(Incident).where(Incident.id == incident_id).with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if incident is None:
-                    raise IncidentNotFoundError(f"Incident {incident_id} not found")
+        with bind_log_context(
+            incident_id=str(incident_id),
+            actor_id=rejected_by,
+            actor_role=rejected_by_role,
+        ):
+            async with self.session_factory() as session:
+                async with session.begin():
+                    incident = (
+                        await session.execute(
+                            select(Incident).where(Incident.id == incident_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if incident is None:
+                        raise IncidentNotFoundError(f"Incident {incident_id} not found")
 
-                approval = await get_approval_for_update(session, incident_id)
-                if (
-                    incident.status != "PENDING_APPROVAL"
-                    or approval is None
-                    or approval.status != "PENDING"
-                ):
-                    raise ConflictStateError(
-                        f"Cannot reject incident in status={incident.status}, "
-                        f"approval_status={approval.status if approval else 'NONE'}"
-                    )
+                    approval = await get_approval_for_update(session, incident_id)
+                    if (
+                        incident.status != "PENDING_APPROVAL"
+                        or approval is None
+                        or approval.status != "PENDING"
+                    ):
+                        raise ConflictStateError(
+                            f"Cannot reject incident in status={incident.status}, "
+                            f"approval_status={approval.status if approval else 'NONE'}"
+                        )
 
-                now = datetime.now(timezone.utc)
-                approval.status = "REJECTED"
-                approval.approved_by = rejected_by
-                approval.approval_comment = comment
-                approval.decided_at = now
+                    now = datetime.now(timezone.utc)
+                    approval.status = "REJECTED"
+                    approval.approved_by = rejected_by
+                    approval.approved_by_role = rejected_by_role
+                    approval.approval_comment = comment
+                    approval.decided_at = now
 
-                incident.status = "REJECTED"
-                bb = dict(incident.blackboard or {})
-                bb["stage"] = "REJECTED"
-                incident.blackboard = bb
-                flag_modified(incident, "blackboard")
-                incident.version += 1
+                    incident.status = "REJECTED"
+                    bb = dict(incident.blackboard or {})
+                    bb["stage"] = "REJECTED"
+                    incident.blackboard = bb
+                    flag_modified(incident, "blackboard")
+                    incident.version += 1
 
-                exec_task = (
-                    await session.execute(
-                        select(AgentTask)
-                        .where(AgentTask.id == approval.task_id)
-                        .with_for_update()
-                    )
-                ).scalar_one()
-                exec_task.status = "FAILED"
-                exec_task.error_message = f"Rejected by {rejected_by}"
-                exec_task.completed_at = now
-
-                pending_events.append(
-                    await append_trace_event(
-                        session,
-                        incident_id=incident.id,
-                        agent_role="HUMAN_OPERATOR",
-                        event_type="APPROVAL_REJECTED",
-                        risk_tier="HIGH_RISK_WRITE",
-                        summary=f"Operator {rejected_by} rejected remediation; high-risk write aborted.",
-                        payload={"rejected_by": rejected_by, "comment": comment or ""},
-                    )
-                )
-                blackboard_copy = dict(incident.blackboard)
-
-        await self._publish_pending(incident_id, pending_events, blackboard_copy)
-        async with self.session_factory() as read_sess:
-            refreshed = await get_incident_full(read_sess, incident_id)
-            assert refreshed is not None
-            return refreshed
-
-    async def execute_remediation_direct(self, incident_id: UUID) -> Incident:
-        """Explicit execution entrypoint enforcing Fail-Closed human approval gate."""
-        pending_events: list[TraceEvent] = []
-        blocked_exc: ApprovalRequiredError | PolicyViolationError | None = None
-        blocked_trace: TraceEvent | None = None
-        blackboard_copy: dict[str, Any] | None = None
-
-        async with self.session_factory() as session:
-            async with session.begin():
-                incident = (
-                    await session.execute(
-                        select(Incident).where(Incident.id == incident_id).with_for_update()
-                    )
-                ).scalar_one_or_none()
-                if incident is None:
-                    raise IncidentNotFoundError(f"Incident {incident_id} not found")
-
-                approval = await get_approval_for_update(session, incident_id)
-                tool_name = (
-                    (approval.action_plan or {}).get("tool_name")
-                    if approval is not None
-                    else ""
-                )
-
-                try:
-                    self.policy_guard.authorize_tool_call(
-                        agent_role="EXECUTOR",
-                        tool_name=tool_name,
-                        incident=incident,
-                        approval=approval,
-                    )
-                except (ApprovalRequiredError, PolicyViolationError) as exc:
-                    blocked_exc = exc
-                    blocked_trace = await append_trace_event(
-                        session,
-                        incident_id=incident.id,
-                        agent_role="POLICY_GATE",
-                        event_type="EXECUTION_BLOCKED_FAIL_CLOSED",
-                        risk_tier="HIGH_RISK_WRITE",
-                        summary=str(exc),
-                        payload={
-                            "incident_status": incident.status,
-                            "approval_status": approval.status if approval else "NONE",
-                            "code": "APPROVAL_REQUIRED_FAIL_CLOSED",
-                        },
-                    )
-                    pending_events.append(blocked_trace)
-                    blackboard_copy = dict(incident.blackboard or {})
-                else:
-                    assert approval is not None
                     exec_task = (
                         await session.execute(
                             select(AgentTask)
@@ -889,11 +841,112 @@ class AIOpsOrchestrator:
                             .with_for_update()
                         )
                     ).scalar_one()
-                    if exec_task.status != "COMPLETED":
-                        await self._execute_approved_remediation(
-                            session, incident, exec_task, approval, pending_events
+                    exec_task.status = "FAILED"
+                    exec_task.error_message = f"Rejected by {rejected_by} ({rejected_by_role})"
+                    exec_task.completed_at = now
+
+                    pending_events.append(
+                        await append_trace_event(
+                            session,
+                            incident_id=incident.id,
+                            agent_role="HUMAN_OPERATOR",
+                            event_type="APPROVAL_REJECTED",
+                            risk_tier="HIGH_RISK_WRITE",
+                            summary=f"Operator {rejected_by} ({rejected_by_role}) rejected remediation; high-risk write aborted.",
+                            payload={
+                                "actor_id": rejected_by,
+                                "actor_role": rejected_by_role,
+                                "rejected_by": rejected_by,
+                                "comment": comment or "",
+                            },
                         )
-                    blackboard_copy = dict(incident.blackboard or {})
+                    )
+                    blackboard_copy = dict(incident.blackboard)
+            logger.info("Remediation rejected by %s (%s)", rejected_by, rejected_by_role)
+
+        await self._publish_pending(incident_id, pending_events, blackboard_copy)
+        async with self.session_factory() as read_sess:
+            refreshed = await get_incident_full(read_sess, incident_id)
+            assert refreshed is not None
+            return refreshed
+
+    async def execute_remediation_direct(
+        self,
+        incident_id: UUID,
+        *,
+        actor_id: str = "system",
+        actor_role: str = "SRE_APPROVER",
+    ) -> Incident:
+        """Explicit execution entrypoint enforcing Fail-Closed human approval gate."""
+        pending_events: list[TraceEvent] = []
+        blocked_exc: ApprovalRequiredError | PolicyViolationError | None = None
+        blocked_trace: TraceEvent | None = None
+        blackboard_copy: dict[str, Any] | None = None
+
+        with bind_log_context(
+            incident_id=str(incident_id),
+            actor_id=actor_id,
+            actor_role=actor_role,
+        ):
+            async with self.session_factory() as session:
+                async with session.begin():
+                    incident = (
+                        await session.execute(
+                            select(Incident).where(Incident.id == incident_id).with_for_update()
+                        )
+                    ).scalar_one_or_none()
+                    if incident is None:
+                        raise IncidentNotFoundError(f"Incident {incident_id} not found")
+
+                    approval = await get_approval_for_update(session, incident_id)
+                    tool_name = (
+                        (approval.action_plan or {}).get("tool_name")
+                        if approval is not None
+                        else ""
+                    )
+
+                    try:
+                        self.policy_guard.authorize_tool_call(
+                            agent_role="EXECUTOR",
+                            tool_name=tool_name,
+                            incident=incident,
+                            approval=approval,
+                        )
+                    except (ApprovalRequiredError, PolicyViolationError) as exc:
+                        blocked_exc = exc
+                        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="APPROVAL_REQUIRED_FAIL_CLOSED").inc()
+                        blocked_trace = await append_trace_event(
+                            session,
+                            incident_id=incident.id,
+                            agent_role="POLICY_GATE",
+                            event_type="EXECUTION_BLOCKED_FAIL_CLOSED",
+                            risk_tier="HIGH_RISK_WRITE",
+                            summary=str(exc),
+                            payload={
+                                "incident_status": incident.status,
+                                "approval_status": approval.status if approval else "NONE",
+                                "actor_id": actor_id,
+                                "actor_role": actor_role,
+                                "code": "APPROVAL_REQUIRED_FAIL_CLOSED",
+                            },
+                        )
+                        pending_events.append(blocked_trace)
+                        blackboard_copy = dict(incident.blackboard or {})
+                        logger.warning("Direct /execute blocked Fail-Closed for actor=%s", actor_id)
+                    else:
+                        assert approval is not None
+                        exec_task = (
+                            await session.execute(
+                                select(AgentTask)
+                                .where(AgentTask.id == approval.task_id)
+                                .with_for_update()
+                            )
+                        ).scalar_one()
+                        if exec_task.status != "COMPLETED":
+                            await self._execute_approved_remediation(
+                                session, incident, exec_task, approval, pending_events
+                            )
+                        blackboard_copy = dict(incident.blackboard or {})
 
         await self._publish_pending(incident_id, pending_events, blackboard_copy)
         if blocked_exc is not None:

@@ -27,6 +27,9 @@ class Settings(BaseSettings):
     outbox_batch_size: int = 100
     outbox_poll_interval_seconds: float = 0.2
     shutdown_timeout_seconds: float = 10.0
+    rbac_viewer_token: str = "viewer-demo-token"
+    rbac_approver_token: str = "sre-approver-demo-token"
+    auto_init_db: bool = False
     skills_dir: Path = Path(__file__).resolve().parents[1] / "skills"
 
 

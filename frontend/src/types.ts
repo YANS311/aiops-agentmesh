@@ -4,6 +4,13 @@ export interface HealthResponse {
   redis: string;
 }
 
+export type RoleType = 'VIEWER' | 'SRE_APPROVER';
+
+export interface ActorInfo {
+  actor_id: string;
+  role: RoleType;
+}
+
 export interface SkillOut {
   skill_id: string;
   fault_type: string;
@@ -45,6 +52,7 @@ export interface RemediationApproval {
   action_plan: Record<string, unknown>;
   status: string;
   approved_by: string | null;
+  approved_by_role: string | null;
   approval_comment: string | null;
   decided_at: string | null;
   executed_at: string | null;

@@ -2,7 +2,7 @@ import json
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 
@@ -15,6 +15,7 @@ from app.agents.orchestrator import (
     serialize_trace_event,
 )
 from app.api.schemas import (
+    ActorOut,
     ApprovalDecisionRequest,
     HealthResponse,
     IncidentDetailOut,
@@ -24,6 +25,7 @@ from app.api.schemas import (
     TraceEventOut,
     TrajectoryOut,
 )
+from app.auth.rbac import Actor, require_authenticated, require_sre_approver
 from app.db.models import Incident
 from app.db.repositories import (
     get_incident_full,
@@ -51,6 +53,11 @@ async def health_check(request: Request) -> HealthResponse:
     if not redis_ok:
         raise HTTPException(status_code=503, detail="Redis ping failed")
     return HealthResponse(status="ok", postgres="ok", redis="ok")
+
+
+@router.get("/auth/me", response_model=ActorOut)
+async def get_current_actor(actor: Actor = Depends(require_authenticated)) -> ActorOut:
+    return ActorOut(actor_id=actor.actor_id, role=actor.role.value)
 
 
 @router.get("/skills", response_model=list[SkillOut])
@@ -249,12 +256,18 @@ async def stream_incident_events(
 
 @router.post("/incidents/{incident_id}/approve", response_model=IncidentDetailOut)
 async def approve_incident(
-    incident_id: UUID, body: ApprovalDecisionRequest, request: Request
+    incident_id: UUID,
+    body: ApprovalDecisionRequest,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
 ) -> IncidentDetailOut:
     orch = _get_orchestrator(request)
     try:
         incident = await orch.approve_remediation(
-            incident_id, approved_by=body.operator, comment=body.comment
+            incident_id,
+            approved_by=actor.actor_id,
+            approved_by_role=actor.role.value,
+            comment=body.comment,
         )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -265,12 +278,18 @@ async def approve_incident(
 
 @router.post("/incidents/{incident_id}/reject", response_model=IncidentDetailOut)
 async def reject_incident(
-    incident_id: UUID, body: ApprovalDecisionRequest, request: Request
+    incident_id: UUID,
+    body: ApprovalDecisionRequest,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
 ) -> IncidentDetailOut:
     orch = _get_orchestrator(request)
     try:
         incident = await orch.reject_remediation(
-            incident_id, rejected_by=body.operator, comment=body.comment
+            incident_id,
+            rejected_by=actor.actor_id,
+            rejected_by_role=actor.role.value,
+            comment=body.comment,
         )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -281,11 +300,17 @@ async def reject_incident(
 
 @router.post("/incidents/{incident_id}/execute", response_model=IncidentDetailOut)
 async def execute_incident_remediation(
-    incident_id: UUID, request: Request
+    incident_id: UUID,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
 ) -> IncidentDetailOut:
     orch = _get_orchestrator(request)
     try:
-        incident = await orch.execute_remediation_direct(incident_id)
+        incident = await orch.execute_remediation_direct(
+            incident_id,
+            actor_id=actor.actor_id,
+            actor_role=actor.role.value,
+        )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except FailClosedBlockedError as exc:

@@ -161,6 +161,7 @@ class RemediationApproval(Base):
     action_plan: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True, default="PENDING")
     approved_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    approved_by_role: Mapped[str | None] = mapped_column(String(32), nullable=True)
     approval_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
