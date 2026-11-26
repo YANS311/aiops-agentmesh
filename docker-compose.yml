@@ -1,0 +1,32 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: aiops-mesh-pg16
+    ports:
+      - "127.0.0.1:5436:5432"
+    environment:
+      POSTGRES_USER: aiops
+      POSTGRES_PASSWORD: aiops_dev_pwd
+      POSTGRES_DB: aiops_mesh
+    volumes:
+      - pg16_data:/var/lib/postgresql/data
+      - ./docker/postgres/01-init-test-db.sql:/docker-entrypoint-initdb.d/01-init-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aiops -d aiops_mesh"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: aiops-mesh-redis7
+    ports:
+      - "127.0.0.1:6386:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pg16_data:
