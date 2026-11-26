@@ -44,6 +44,9 @@ npm run dev
 # 5. Run Concurrency & Reliability Load Benchmark (LLM_PROVIDER=mock, real PG16 + Redis 7)
 cd backend
 .\.venv\Scripts\python.exe benchmarks\run_load_benchmark.py --tiers 10 30 50 --workers 4 --archivers 2
+
+# 6. Run 12-Case Real DeepSeek Adversarial & Fault-Injection Eval (uses local .env)
+.\.venv\Scripts\python.exe benchmarks\run_llm_eval.py
 ```
 
 ## Concurrency & Reliability Benchmark (Local PG16 + Redis 7, `LLM_PROVIDER=mock`)
@@ -55,3 +58,11 @@ Full root-cause analysis & report: [docs/BENCHMARK.md](docs/BENCHMARK.md) (4 con
 | **10** | 5.02 | **7.15** | **1.42x (+42.4%)** | 1,953.89 | **1,347.68** | **-31.0%** | 100.00% | **0** | **0** |
 | **30** | 3.22 | **8.20** | **2.55x (+154.7%)** | 9,237.87 | **3,574.30** | **-61.3%** | 100.00% | **0** | **0** |
 | **50** | 2.35 | **8.57** | **3.65x (+264.7%)** | 21,158.80 | **5,685.34** | **-73.1%** | 100.00% | **0** | **0** |
+
+## Real DeepSeek Adversarial & Fault-Injection Evaluation (12 Cases)
+
+Full report: [docs/EVAL_REPORT.md](docs/EVAL_REPORT.md) (`deepseek-chat`, 6 normal + 3 prompt-injection + 3 boundary cases):
+
+| Root Cause Hit Rate | Pydantic JSON Pass Rate | Fail-Closed Block Rate | Avg / P95 Inference Latency | Total Token Usage | Redis `XPENDING` |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| **11/11 (100.00%)** | **44/44 (100.00%)** | **12/12 (100.00%)** | **1,695.91 ms / 2,758.95 ms** | **23,375** (13,807 in / 9,568 out) | **0** |
