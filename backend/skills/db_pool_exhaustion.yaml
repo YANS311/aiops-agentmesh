@@ -1,0 +1,24 @@
+skill_id: skill.pg16.pool_exhaustion
+fault_type: db_connection_pool_exhausted
+title: PostgreSQL 16 Connection Pool Exhaustion SOP
+description: >
+  Investigates connection pool saturation caused by idle-in-transaction sessions
+  and application pool leaks, then proposes controlled backend termination and pool recycling.
+default_severity: P0
+default_service: payment-core
+diagnostic_tools:
+  log_agent: query_service_error_logs
+  db_agent: inspect_pg_stat_activity
+remediation:
+  tool_name: terminate_idle_in_tx_and_recycle_pool
+  risk_level: HIGH
+  requires_human_approval: true
+  command_template: >
+    SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+    WHERE state = 'idle in transaction' AND now() - state_change > interval '120 seconds';
+    /* + recycle pool on {service_name} */
+  blast_radius: >
+    Terminates 14 stalled idle-in-transaction database sessions and triggers graceful
+    rolling recycle of the service PgBouncer/SQLAlchemy connection pool.
+  rollback_command: >
+    kubectl rollout undo deployment/{service_name} -n prod-core && pg_ctl reload

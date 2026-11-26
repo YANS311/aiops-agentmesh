@@ -1,0 +1,23 @@
+skill_id: skill.redis.cache_stampede
+fault_type: redis_cache_stampede
+title: Redis Hot-Key Expiration Cache Stampede SOP
+description: >
+  Detects synchronized TTL expiration on high-QPS catalog keys causing DB read spikes,
+  then enables singleflight coalescing and prewarms hot keys.
+default_severity: P1
+default_service: catalog-gateway
+diagnostic_tools:
+  log_agent: query_gateway_latency_logs
+  db_agent: inspect_redis_hotkeys
+remediation:
+  tool_name: enable_singleflight_and_prewarm_hotkey
+  risk_level: HIGH
+  requires_human_approval: true
+  command_template: >
+    redis-cli CONFIG SET notify-keyspace-events Ex &&
+    curl -X POST http://catalog-gateway/admin/cache/singleflight?enabled=true&prewarm=top100
+  blast_radius: >
+    Enables request-coalescing singleflight lock and prewarms top 100 catalog keys in Redis 7;
+    briefly increases Redis memory usage by ~48 MB.
+  rollback_command: >
+    curl -X POST http://catalog-gateway/admin/cache/singleflight?enabled=false
