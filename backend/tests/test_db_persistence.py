@@ -13,7 +13,11 @@ from app.db.repositories import (
     claim_next_queued_task,
     list_incidents,
 )
-from app.redis_bus.events import RedisEventBus
+from app.redis_bus.events import (
+    GLOBAL_EVENTS_STREAM,
+    RedisEventBus,
+    incident_events_stream,
+)
 
 
 @pytest.mark.asyncio
@@ -186,7 +190,7 @@ async def test_for_update_skip_locked_non_blocking_and_concurrent_claim(
 
 
 @pytest.mark.asyncio
-async def test_redis_blackboard_and_pubsub_roundtrip(
+async def test_redis_blackboard_and_streams_roundtrip(
     redis_bus: RedisEventBus,
 ) -> None:
     assert await redis_bus.ping() is True
@@ -196,19 +200,32 @@ async def test_redis_blackboard_and_pubsub_roundtrip(
     cached = await redis_bus.get_blackboard_cache(inc_id)
     assert cached == {"stage": "DIAGNOSING", "hits": 3}
 
-    pubsub = await redis_bus.subscribe_incident_events(inc_id)
-    try:
-        published_receivers = await redis_bus.publish_trace_event(
-            inc_id, {"id": 42, "event_type": "TOOL_RESULT", "summary": "ok"}
-        )
-        assert published_receivers >= 1
+    stream_key = incident_events_stream(inc_id)
+    group_name = "cg:test-roundtrip"
+    await redis_bus.ensure_consumer_group(stream_key, group_name, start_id="0")
 
-        received = None
-        async for msg in redis_bus.iter_pubsub_events(pubsub, keepalive_seconds=1.0):
-            if msg is not None:
-                received = msg
-                break
-        assert received == {"id": 42, "event_type": "TOOL_RESULT", "summary": "ok"}
-    finally:
-        await pubsub.unsubscribe()
-        await pubsub.aclose()
+    inc_entry_id, global_entry_id = await redis_bus.publish_trace_event(
+        inc_id,
+        {
+            "id": 42,
+            "incident_id": str(inc_id),
+            "agent_role": "DB_DIAGNOSTICS",
+            "event_type": "TOOL_RESULT",
+            "risk_tier": "READ_ONLY",
+            "summary": "ok",
+        },
+    )
+    assert inc_entry_id
+    assert global_entry_id
+
+    entries = await redis_bus.read_group(stream_key, group_name, "c1", count=10, block_ms=None)
+    assert len(entries) == 1
+    entry_id, payload = entries[0]
+    assert entry_id == inc_entry_id
+    assert payload["id"] == 42
+    assert await redis_bus.pending_count(stream_key, group_name) == 1
+
+    acked = await redis_bus.ack(stream_key, group_name, entry_id)
+    assert acked == 1
+    assert await redis_bus.pending_count(stream_key, group_name) == 0
+    await redis_bus.destroy_consumer_group(stream_key, group_name)

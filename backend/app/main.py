@@ -8,6 +8,7 @@ import redis.asyncio as aioredis
 from app.agents.llm import MockLLMProvider
 from app.agents.orchestrator import AgentWorker, AIOpsOrchestrator
 from app.agents.tools import ToolRegistry
+from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 from app.api.routes import router as api_router
 from app.config import Settings, get_settings
 from app.db.base import create_engine_and_sessionmaker, init_db
@@ -39,6 +40,13 @@ def create_app(
         tool_registry = ToolRegistry()
         llm_provider = MockLLMProvider()
 
+        trajectory_consumer = TrajectoryStreamConsumer(
+            session_factory=session_factory,
+            redis_bus=redis_bus,
+            consumer_name="archiver-api-1",
+        )
+        await trajectory_consumer.initialize()
+
         orchestrator = AIOpsOrchestrator(
             session_factory=session_factory,
             redis_bus=redis_bus,
@@ -46,8 +54,13 @@ def create_app(
             tool_registry=tool_registry,
             llm_provider=llm_provider,
             step_delay_ms=resolved_settings.step_delay_ms,
+            trajectory_consumer=trajectory_consumer,
         )
-        worker = AgentWorker(orchestrator, worker_id="worker-api-1")
+        worker = AgentWorker(
+            orchestrator,
+            worker_id="worker-api-1",
+            trajectory_consumer=trajectory_consumer,
+        )
 
         app.state.engine = engine
         app.state.session_factory = session_factory
@@ -56,15 +69,18 @@ def create_app(
         app.state.skill_registry = skill_registry
         app.state.tool_registry = tool_registry
         app.state.orchestrator = orchestrator
+        app.state.trajectory_consumer = trajectory_consumer
         app.state.worker = worker
 
         if start_worker:
+            trajectory_consumer.start()
             worker.start()
 
         try:
             yield
         finally:
             await worker.stop()
+            await trajectory_consumer.stop()
             await redis_client.aclose()
             await engine.dispose()
 

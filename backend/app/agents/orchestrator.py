@@ -1,7 +1,7 @@
 import asyncio
 from datetime import datetime, timezone
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from sqlalchemy import select
@@ -18,7 +18,6 @@ from app.agents.tools import (
 from app.db.models import (
     AgentTask,
     Incident,
-    IncidentTrajectory,
     RemediationApproval,
     TraceEvent,
 )
@@ -27,10 +26,12 @@ from app.db.repositories import (
     claim_next_queued_task,
     get_approval_for_update,
     get_incident_full,
-    list_trace_events,
 )
 from app.redis_bus.events import RedisEventBus
 from app.skills.loader import SkillRegistry
+
+if TYPE_CHECKING:
+    from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class AIOpsOrchestrator:
         tool_registry: ToolRegistry,
         llm_provider: LLMProvider,
         step_delay_ms: int = 0,
+        trajectory_consumer: "TrajectoryStreamConsumer | None" = None,
     ) -> None:
         self.session_factory = session_factory
         self.redis_bus = redis_bus
@@ -84,6 +86,7 @@ class AIOpsOrchestrator:
         self.policy_guard = PolicyGuard(tool_registry)
         self.llm = llm_provider
         self.step_delay_ms = step_delay_ms
+        self.trajectory_consumer = trajectory_consumer
         self._wakeup_event = asyncio.Event()
 
     def notify_worker(self) -> None:
@@ -593,79 +596,13 @@ class AIOpsOrchestrator:
             )
         )
 
-        # Hermes-inspired Trajectory Archival for postmortem & Phase 2 regression evaluation.
-        prior_traces = await list_trace_events(session, incident.id)
-        trajectory_doc = {
-            "incident_id": str(incident.id),
-            "title": incident.title,
-            "severity": incident.severity,
-            "service_name": incident.service_name,
-            "fault_type": incident.fault_type,
-            "skill_id": approval.skill_id,
-            "root_cause": incident.root_cause_summary or "",
-            "evidence": (incident.blackboard or {}).get("evidence", {}),
-            "approval_audit": {
-                "approval_id": str(approval.id),
-                "approved_by": approval.approved_by,
-                "approval_comment": approval.approval_comment,
-                "decided_at": approval.decided_at.isoformat() if approval.decided_at else None,
-                "executed_at": now.isoformat(),
-            },
-            "execution_result": exec_result,
-            "trace_steps": [
-                {
-                    "id": ev.id,
-                    "agent_role": ev.agent_role,
-                    "event_type": ev.event_type,
-                    "risk_tier": ev.risk_tier,
-                    "summary": ev.summary,
-                }
-                for ev in prior_traces
-            ],
-            "archived_at": now.isoformat(),
-        }
-        trajectory = IncidentTrajectory(
-            incident_id=incident.id,
-            skill_id=approval.skill_id,
-            fault_type=incident.fault_type,
-            root_cause=incident.root_cause_summary or "",
-            resolution_command=approval.proposed_command,
-            trajectory_doc=trajectory_doc,
-        )
-        session.add(trajectory)
-        await session.flush()
-
+        # Trajectory archival & RESOLVED transition are consumed downstream via Redis Streams (Consumer Group + XACK).
         bb = dict(incident.blackboard or {})
-        bb["stage"] = "RESOLVED"
+        bb["stage"] = "AWAITING_TRAJECTORY_ARCHIVE"
         bb["execution_result"] = exec_result
         incident.blackboard = bb
         flag_modified(incident, "blackboard")
-        incident.status = "RESOLVED"
-        incident.resolved_at = now
         incident.version += 1
-
-        pending_events.append(
-            await append_trace_event(
-                session,
-                incident_id=incident.id,
-                agent_role="ARCHIVER",
-                event_type="TRAJECTORY_ARCHIVED",
-                risk_tier="NONE",
-                summary=f"Archived resolution trajectory ({len(prior_traces) + 1} steps) for {approval.skill_id}",
-                payload={"trajectory_id": str(trajectory.id), "skill_id": approval.skill_id},
-            )
-        )
-        pending_events.append(
-            await append_trace_event(
-                session,
-                incident_id=incident.id,
-                agent_role="SYSTEM",
-                event_type="INCIDENT_RESOLVED",
-                risk_tier="NONE",
-                summary=f"Incident {incident.id} resolved and trajectory archived.",
-                payload={"status": "RESOLVED", "trajectory_id": str(trajectory.id)},
-            )
-        )
 
     async def approve_remediation(
         self,
@@ -882,6 +819,9 @@ class AIOpsOrchestrator:
             assert blocked_trace is not None
             raise FailClosedBlockedError(str(blocked_exc), blocked_trace)
 
+        if self.trajectory_consumer is not None:
+            await self.trajectory_consumer.drain_until_empty()
+
         async with self.session_factory() as read_sess:
             refreshed = await get_incident_full(read_sess, incident_id)
             assert refreshed is not None
@@ -891,9 +831,15 @@ class AIOpsOrchestrator:
 class AgentWorker:
     """Async background task runner consuming PG16 FOR UPDATE SKIP LOCKED queue."""
 
-    def __init__(self, orchestrator: AIOpsOrchestrator, worker_id: str = "worker-main") -> None:
+    def __init__(
+        self,
+        orchestrator: AIOpsOrchestrator,
+        worker_id: str = "worker-main",
+        trajectory_consumer: "TrajectoryStreamConsumer | None" = None,
+    ) -> None:
         self.orchestrator = orchestrator
         self.worker_id = worker_id
+        self.trajectory_consumer = trajectory_consumer
         self._stop_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -901,9 +847,14 @@ class AgentWorker:
         processed = 0
         while processed < max_steps:
             did_work = await self.orchestrator.process_one_task(self.worker_id)
-            if not did_work:
-                break
-            processed += 1
+            if did_work:
+                processed += 1
+                continue
+            if self.trajectory_consumer is not None:
+                drained = await self.trajectory_consumer.drain_until_empty()
+                if drained > 0:
+                    continue
+            break
         return processed
 
     async def _loop(self) -> None:

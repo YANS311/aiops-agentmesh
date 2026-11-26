@@ -1,6 +1,6 @@
 import json
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
@@ -32,6 +32,7 @@ from app.db.repositories import (
     list_trace_events,
     list_trajectories,
 )
+from app.redis_bus.events import incident_events_stream
 
 router = APIRouter(prefix="/api/v1", tags=["aiops"])
 
@@ -149,13 +150,20 @@ async def stream_incident_events(
         if exists is None:
             raise HTTPException(status_code=404, detail="Incident not found")
 
+    header_last_id = request.headers.get("last-event-id")
+    parsed_header_id = int(header_last_id) if header_last_id and header_last_id.isdigit() else 0
+    resume_after_id = max(after_id, parsed_header_id)
+
     async def event_generator():
-        # Subscribe BEFORE reading PG16 history so live events cannot be missed in the gap.
-        pubsub = await redis_bus.subscribe_incident_events(incident_id)
-        last_sent_id = after_id
+        stream_key = incident_events_stream(incident_id)
+        group_name = f"cg:sse:{uuid4().hex}"
+        consumer_name = "sse-1"
+        # Create Consumer Group BEFORE reading PG16 history so zero stream entries are missed.
+        await redis_bus.ensure_consumer_group(stream_key, group_name, start_id="0")
+        last_sent_id = resume_after_id
         try:
             async with session_factory() as session:
-                history = await list_trace_events(session, incident_id, after_id=after_id)
+                history = await list_trace_events(session, incident_id, after_id=resume_after_id)
                 current_status = (
                     await session.execute(
                         select(Incident.status).where(Incident.id == incident_id)
@@ -168,13 +176,23 @@ async def stream_incident_events(
                 yield f"id: {ev.id}\nevent: trace\ndata: {json.dumps(payload)}\n\n"
 
             if current_status in TERMINAL_INCIDENT_STATUSES:
+                # Drain any backlog in this ephemeral group cleanly before finishing.
+                backlog = await redis_bus.read_group(
+                    stream_key, group_name, consumer_name, count=100, block_ms=None
+                )
+                if backlog:
+                    await redis_bus.ack(stream_key, group_name, *(eid for eid, _ in backlog))
                 yield f"event: complete\ndata: {json.dumps({'status': current_status})}\n\n"
                 return
 
-            async for msg in redis_bus.iter_pubsub_events(pubsub, keepalive_seconds=5.0):
+            while True:
                 if await request.is_disconnected():
                     return
-                if msg is None:
+
+                entries = await redis_bus.read_group(
+                    stream_key, group_name, consumer_name, count=50, block_ms=1000
+                )
+                if not entries:
                     async with session_factory() as check_sess:
                         status_now = (
                             await check_sess.execute(
@@ -182,32 +200,41 @@ async def stream_incident_events(
                             )
                         ).scalar_one()
                     if status_now in TERMINAL_INCIDENT_STATUSES:
+                        flush_entries = await redis_bus.read_group(
+                            stream_key, group_name, consumer_name, count=100, block_ms=None
+                        )
+                        for entry_id, msg in flush_entries:
+                            ev_id = int(msg["id"])
+                            if ev_id > last_sent_id:
+                                last_sent_id = ev_id
+                                yield f"id: {ev_id}\nevent: trace\ndata: {json.dumps(msg)}\n\n"
+                            await redis_bus.ack(stream_key, group_name, entry_id)
                         yield f"event: complete\ndata: {json.dumps({'status': status_now})}\n\n"
                         return
                     yield ": keepalive\n\n"
                     continue
 
-                ev_id = int(msg["id"])
-                if ev_id <= last_sent_id:
-                    continue
-                last_sent_id = ev_id
-                yield f"id: {ev_id}\nevent: trace\ndata: {json.dumps(msg)}\n\n"
+                for entry_id, msg in entries:
+                    ev_id = int(msg["id"])
+                    if ev_id > last_sent_id:
+                        last_sent_id = ev_id
+                        yield f"id: {ev_id}\nevent: trace\ndata: {json.dumps(msg)}\n\n"
+                    await redis_bus.ack(stream_key, group_name, entry_id)
 
-                ev_type = msg.get("event_type")
-                if ev_type in {"INCIDENT_RESOLVED", "APPROVAL_REJECTED", "INCIDENT_FAILED"}:
-                    terminal_map = {
-                        "INCIDENT_RESOLVED": "RESOLVED",
-                        "APPROVAL_REJECTED": "REJECTED",
-                        "INCIDENT_FAILED": "FAILED",
-                    }
-                    yield (
-                        f"event: complete\n"
-                        f"data: {json.dumps({'status': terminal_map[ev_type]})}\n\n"
-                    )
-                    return
+                    ev_type = msg.get("event_type")
+                    if ev_type in {"INCIDENT_RESOLVED", "APPROVAL_REJECTED", "INCIDENT_FAILED"}:
+                        terminal_map = {
+                            "INCIDENT_RESOLVED": "RESOLVED",
+                            "APPROVAL_REJECTED": "REJECTED",
+                            "INCIDENT_FAILED": "FAILED",
+                        }
+                        yield (
+                            f"event: complete\n"
+                            f"data: {json.dumps({'status': terminal_map[ev_type]})}\n\n"
+                        )
+                        return
         finally:
-            await pubsub.unsubscribe()
-            await pubsub.aclose()
+            await redis_bus.destroy_consumer_group(stream_key, group_name)
 
     return StreamingResponse(
         event_generator(),

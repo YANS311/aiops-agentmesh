@@ -9,6 +9,7 @@ from app.agents.orchestrator import (
     FailClosedBlockedError,
 )
 from app.agents.tools import ToolRegistry
+from app.agents.trajectory_consumer import TrajectoryStreamConsumer
 from app.config import get_settings
 from app.db.repositories import (
     get_incident_full,
@@ -24,6 +25,11 @@ def _build_orchestrator(
     redis_bus: RedisEventBus,
 ) -> tuple[AIOpsOrchestrator, AgentWorker]:
     settings = get_settings()
+    consumer = TrajectoryStreamConsumer(
+        session_factory=session_factory,
+        redis_bus=redis_bus,
+        consumer_name="test-archiver",
+    )
     orch = AIOpsOrchestrator(
         session_factory=session_factory,
         redis_bus=redis_bus,
@@ -31,8 +37,9 @@ def _build_orchestrator(
         tool_registry=ToolRegistry(),
         llm_provider=MockLLMProvider(),
         step_delay_ms=0,
+        trajectory_consumer=consumer,
     )
-    return orch, AgentWorker(orch, worker_id="test-worker")
+    return orch, AgentWorker(orch, worker_id="test-worker", trajectory_consumer=consumer)
 
 
 @pytest.mark.asyncio
