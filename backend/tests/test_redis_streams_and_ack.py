@@ -139,20 +139,25 @@ async def test_sse_consumer_group_acks_and_destroys_ephemeral_group(
         database_url=test_db_url,
         redis_url=test_redis_url,
         start_worker=True,
+        enable_fault_injection=True,
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
 
     async with LifespanManager(app) as manager:
         transport = httpx.ASGITransport(app=manager.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             inject_resp = await client.post(
                 "/api/v1/incidents/inject",
+                headers=viewer_headers,
                 json={"fault_type": "redis_cache_stampede"},
             )
             assert inject_resp.status_code == 201
             incident_id = inject_resp.json()["id"]
 
             for _ in range(50):
-                r = await client.get(f"/api/v1/incidents/{incident_id}")
+                r = await client.get(
+                    f"/api/v1/incidents/{incident_id}", headers=viewer_headers
+                )
                 if r.json()["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
@@ -169,7 +174,9 @@ async def test_sse_consumer_group_acks_and_destroys_ephemeral_group(
             async def read_sse() -> list[str]:
                 seen_events: list[str] = []
                 async with client.stream(
-                    "GET", f"/api/v1/incidents/{incident_id}/events"
+                    "GET",
+                    f"/api/v1/incidents/{incident_id}/events",
+                    headers=viewer_headers,
                 ) as sse_resp:
                     assert sse_resp.status_code == 200
                     current_event = "message"

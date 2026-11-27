@@ -74,6 +74,8 @@ class ApprovalOut(BaseModel):
     proposed_command: str
     action_plan: dict[str, Any]
     status: str
+    execution_plan_hash: str | None = None
+    expires_at: datetime | None = None
     approved_by: str | None
     approved_by_role: str | None
     approval_comment: str | None

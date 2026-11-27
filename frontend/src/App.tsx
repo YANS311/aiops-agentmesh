@@ -34,6 +34,7 @@ import {
   parseNLIntent,
   registerA2APeer,
   rejectIncident,
+  subscribeIncidentEvents,
 } from './api';
 import type {
   A2APeerDiscoverResponse,
@@ -130,28 +131,33 @@ export default function App() {
   const [nlQuery, setNlQuery] = useState<string>('');
   const [nlDraft, setNlDraft] = useState<NLParseResponse | null>(null);
 
-  const refreshListAndDetail = useCallback(async (targetId: string | null) => {
-    try {
-      const list = await fetchIncidents();
-      setIncidents(list);
-      if (targetId) {
-        const d = await fetchIncidentDetail(targetId);
-        setDetail(d);
+  const refreshListAndDetail = useCallback(
+    async (targetId: string | null) => {
+      const token = ROLE_TOKENS[activeRole];
+      try {
+        const list = await fetchIncidents(token);
+        setIncidents(list);
+        if (targetId) {
+          const d = await fetchIncidentDetail(targetId, token);
+          setDetail(d);
+        }
+      } catch (err) {
+        setUiError(err instanceof Error ? err.message : String(err));
       }
-    } catch (err) {
-      setUiError(err instanceof Error ? err.message : String(err));
-    }
-  }, []);
+    },
+    [activeRole]
+  );
 
   useEffect(() => {
     let active = true;
+    const token = ROLE_TOKENS[activeRole];
     (async () => {
       try {
         const [h, s, list, peers] = await Promise.all([
           fetchHealth(),
-          fetchSkills(),
-          fetchIncidents(),
-          fetchA2APeers(),
+          fetchSkills(token),
+          fetchIncidents(token),
+          fetchA2APeers(token),
         ]);
         if (!active) return;
         setHealth(h);
@@ -159,7 +165,7 @@ export default function App() {
         setIncidents(list);
         setA2aPeers(peers);
         if (list.length > 0) {
-          setSelectedId(list[0].id);
+          setSelectedId((prev) => prev ?? list[0].id);
         }
       } catch (err) {
         if (active) {
@@ -170,7 +176,7 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [activeRole]);
 
   useEffect(() => {
     let active = true;
@@ -204,46 +210,40 @@ export default function App() {
 
     void refreshListAndDetail(selectedId);
 
-    const es = new EventSource(`/api/v1/incidents/${selectedId}/events`);
-
-    es.addEventListener('trace', (ev: MessageEvent<string>) => {
-      if (cancelled) return;
-      const parsed = JSON.parse(ev.data) as TraceEvent;
-      setTraces((prev) => {
-        if (prev.some((item) => item.id === parsed.id)) {
-          return prev;
+    const token = ROLE_TOKENS[activeRole];
+    const unsubscribe = subscribeIncidentEvents(
+      selectedId,
+      token,
+      (parsed) => {
+        if (cancelled) return;
+        setTraces((prev) => {
+          if (prev.some((item) => item.id === parsed.id)) {
+            return prev;
+          }
+          return [...prev, parsed];
+        });
+        if (REFRESH_TRIGGER_EVENTS.has(parsed.event_type)) {
+          void refreshListAndDetail(selectedId);
         }
-        return [...prev, parsed];
-      });
-      if (REFRESH_TRIGGER_EVENTS.has(parsed.event_type)) {
-        void refreshListAndDetail(selectedId);
+      },
+      () => {
+        if (!cancelled) {
+          void refreshListAndDetail(selectedId);
+        }
       }
-    });
-
-    es.addEventListener('complete', () => {
-      if (!cancelled) {
-        void refreshListAndDetail(selectedId);
-      }
-      es.close();
-    });
-
-    es.onerror = () => {
-      if (es.readyState === EventSource.CLOSED) {
-        es.close();
-      }
-    };
+    );
 
     return () => {
       cancelled = true;
-      es.close();
+      unsubscribe();
     };
-  }, [selectedId, refreshListAndDetail]);
+  }, [selectedId, activeRole, refreshListAndDetail]);
 
   const handleInjectFault = async () => {
     setBusyAction(true);
     setUiError(null);
     try {
-      const created = await injectFault(selectedFault);
+      const created = await injectFault(selectedFault, ROLE_TOKENS[activeRole]);
       setSelectedId(created.id);
       await refreshListAndDetail(created.id);
     } catch (err) {
@@ -258,7 +258,7 @@ export default function App() {
     setUiError(null);
     setA2aNotice(null);
     try {
-      const preview = await discoverA2APeer(a2aEndpoint);
+      const preview = await discoverA2APeer(a2aEndpoint, ROLE_TOKENS[activeRole]);
       setA2aPreview(preview);
     } catch (err) {
       setA2aPreview(null);
@@ -280,7 +280,7 @@ export default function App() {
     setA2aNotice(null);
     try {
       await registerA2APeer(a2aEndpoint, ROLE_TOKENS[activeRole]);
-      const updatedPeers = await fetchA2APeers();
+      const updatedPeers = await fetchA2APeers(ROLE_TOKENS[activeRole]);
       setA2aPeers(updatedPeers);
       setA2aPreview(null);
       setA2aNotice(`已成功接入 A2A 节点：${a2aEndpoint}`);
@@ -299,7 +299,7 @@ export default function App() {
     setBusyAction(true);
     try {
       await deleteA2APeer(peerId, ROLE_TOKENS[activeRole]);
-      setA2aPeers(await fetchA2APeers());
+      setA2aPeers(await fetchA2APeers(ROLE_TOKENS[activeRole]));
     } catch (err) {
       setUiError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -312,7 +312,7 @@ export default function App() {
     setBusyAction(true);
     setUiError(null);
     try {
-      const draft = await parseNLIntent(nlQuery.trim());
+      const draft = await parseNLIntent(nlQuery.trim(), ROLE_TOKENS[activeRole]);
       setNlDraft(draft);
     } catch (err) {
       setUiError(err instanceof Error ? err.message : String(err));
@@ -326,7 +326,7 @@ export default function App() {
     setBusyAction(true);
     setUiError(null);
     try {
-      const created = await confirmNLIntent(nlDraft);
+      const created = await confirmNLIntent(nlDraft, ROLE_TOKENS[activeRole]);
       setNlDraft(null);
       setSelectedId(created.id);
       await refreshListAndDetail(created.id);

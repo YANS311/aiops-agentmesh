@@ -1,7 +1,8 @@
 name: aiops-agentmesh-prod
 
 x-backend-env: &backend-env
-  DATABASE_URL: postgresql+asyncpg://aiops:aiops_prod_pwd@postgres:5432/aiops_mesh
+  APP_ENV: ${APP_ENV:-production}
+  DATABASE_URL: postgresql+asyncpg://aiops:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@postgres:5432/aiops_mesh
   REDIS_URL: redis://redis:6379/0
   LLM_PROVIDER: ${LLM_PROVIDER:-mock}
   LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
@@ -9,9 +10,12 @@ x-backend-env: &backend-env
   LLM_API_KEY: ${LLM_API_KEY:-}
   AUTO_INIT_DB: "false"
   EMBEDDED_WORKERS: "false"
+  ENABLE_FAULT_INJECTION: "false"
   TOOL_EXECUTION_MODE: ${TOOL_EXECUTION_MODE:-live}
-  RBAC_VIEWER_TOKEN: ${RBAC_VIEWER_TOKEN:-viewer-demo-token}
-  RBAC_APPROVER_TOKEN: ${RBAC_APPROVER_TOKEN:-sre-approver-demo-token}
+  APPROVAL_TTL_SECONDS: ${APPROVAL_TTL_SECONDS:-900}
+  RBAC_VIEWER_TOKEN: ${VIEWER_API_TOKEN:?VIEWER_API_TOKEN is required}
+  RBAC_APPROVER_TOKEN: ${SRE_APPROVER_API_TOKEN:?SRE_APPROVER_API_TOKEN is required}
+  ALERTMANAGER_WEBHOOK_SECRET: ${ALERTMANAGER_WEBHOOK_SECRET:?ALERTMANAGER_WEBHOOK_SECRET is required}
   SHUTDOWN_TIMEOUT_SECONDS: "10"
   A2A_PEER_URLS: ${A2A_PEER_URLS:-http://guidance-a2a-adapter:8020}
   A2A_AUTH_TOKEN: ${A2A_AUTH_TOKEN:-}
@@ -22,7 +26,7 @@ services:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: aiops
-      POSTGRES_PASSWORD: aiops_prod_pwd
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_DB: aiops_mesh
     volumes:
       - pg16_prod_data:/var/lib/postgresql/data

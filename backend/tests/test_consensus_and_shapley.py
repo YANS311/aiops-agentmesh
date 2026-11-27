@@ -64,7 +64,9 @@ async def test_parallel_diagnosis_consensus_reached_and_archived_in_trajectory(
         database_url=test_db_url,
         redis_url=test_redis_url,
         start_worker=True,
+        enable_fault_injection=True,
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
     approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
 
     async with LifespanManager(app) as manager:
@@ -72,6 +74,7 @@ async def test_parallel_diagnosis_consensus_reached_and_archived_in_trajectory(
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             inj = await client.post(
                 "/api/v1/incidents/inject",
+                headers=viewer_headers,
                 json={"fault_type": "redis_cache_stampede"},
             )
             assert inj.status_code == 201
@@ -79,7 +82,9 @@ async def test_parallel_diagnosis_consensus_reached_and_archived_in_trajectory(
 
             detail = None
             for _ in range(60):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
@@ -115,7 +120,9 @@ async def test_parallel_diagnosis_consensus_reached_and_archived_in_trajectory(
             assert app_resp.status_code == 200
 
             for _ in range(60):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "RESOLVED":
                     break
                 await asyncio.sleep(0.05)

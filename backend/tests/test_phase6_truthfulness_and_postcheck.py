@@ -143,13 +143,23 @@ async def test_simulated_remediation_never_marked_verified_and_increments_metric
             assert app_resp.status_code == 200
             await worker.run_until_quiescent()
 
-            detail = (await client.get(f"/api/v1/incidents/{inc.id}")).json()
+            detail = (
+                await client.get(
+                    f"/api/v1/incidents/{inc.id}",
+                    headers={"Authorization": f"Bearer {settings.rbac_viewer_token}"},
+                )
+            ).json()
             assert detail["status"] == "RESOLVED"
             assert detail["approval"]["execution_result"]["execution_outcome"] == ExecutionOutcome.SIMULATED.value
             assert detail["approval"]["execution_result"]["simulated"] is True
             assert detail["trajectory"]["trajectory_doc"]["execution_outcome"] == ExecutionOutcome.SIMULATED.value
 
-            traces = (await client.get(f"/api/v1/incidents/{inc.id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{inc.id}/traces",
+                    headers={"Authorization": f"Bearer {settings.rbac_viewer_token}"},
+                )
+            ).json()
             assert any(t["event_type"] == "REMEDIATION_SIMULATED" for t in traces)
             assert not any(t["event_type"] == "POST_CHECK_VERIFIED" for t in traces)
 

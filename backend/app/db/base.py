@@ -37,6 +37,8 @@ _IDEMPOTENT_MIGRATIONS: list[str] = [
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(128)",
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS approved_by_role VARCHAR(32)",
+    "ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS execution_plan_hash VARCHAR(64)",
+    "ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS alert_fingerprint VARCHAR(128)",
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS dedup_count INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_triggered_at TIMESTAMPTZ NOT NULL DEFAULT now()",

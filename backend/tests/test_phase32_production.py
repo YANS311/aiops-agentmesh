@@ -32,6 +32,7 @@ async def test_rbac_auth_401_403_and_approver_actor_audit_persistence(
         database_url=test_db_url,
         redis_url=test_redis_url,
         start_worker=True,
+        enable_fault_injection=True,
     )
 
     viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
@@ -53,13 +54,16 @@ async def test_rbac_auth_401_403_and_approver_actor_audit_persistence(
             # Inject fault and wait for PENDING_APPROVAL
             inj = await client.post(
                 "/api/v1/incidents/inject",
+                headers=viewer_headers,
                 json={"fault_type": "db_connection_pool_exhausted"},
             )
             assert inj.status_code == 201
             incident_id = inj.json()["id"]
 
             for _ in range(50):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
@@ -96,13 +100,19 @@ async def test_rbac_auth_401_403_and_approver_actor_audit_persistence(
 
             # Wait for RESOLVED and verify audit trace persisted actor_id & actor_role
             for _ in range(50):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "RESOLVED":
                     break
                 await asyncio.sleep(0.05)
             assert detail["status"] == "RESOLVED"
 
-            traces = (await client.get(f"/api/v1/incidents/{incident_id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{incident_id}/traces", headers=viewer_headers
+                )
+            ).json()
             granted = [t for t in traces if t["event_type"] == "APPROVAL_GRANTED"]
             assert len(granted) == 1
             assert granted[0]["payload"]["actor_id"] == "sre-lead-01"

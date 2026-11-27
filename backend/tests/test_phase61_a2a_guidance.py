@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import importlib.util
+import json
 import os
 from pathlib import Path
 import sys
@@ -78,6 +81,7 @@ async def test_a2a_agent_card_discovery_and_fail_closed_rejection(
         a2a_client=a2a_client,
         a2a_peer_urls=["http://guidance-a2a-adapter:8020"],
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
     async with LifespanManager(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
@@ -90,7 +94,7 @@ async def test_a2a_agent_card_discovery_and_fail_closed_rejection(
                 "fail_closed_remediation_gate",
             }
 
-            peers_resp = await client.get("/api/v1/a2a/peers")
+            peers_resp = await client.get("/api/v1/a2a/peers", headers=viewer_headers)
             assert peers_resp.status_code == 200
             peers = peers_resp.json()
             assert len(peers) == 1
@@ -140,14 +144,14 @@ async def test_cross_agent_a2a_guidance_closed_loop(
         a2a_client=a2a_client,
         a2a_peer_urls=["http://guidance-a2a-adapter:8020"],
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
     approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
 
     async with LifespanManager(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-            wh = await client.post(
-                "/api/v1/webhooks/alertmanager",
-                json={
+            wh_bytes = json.dumps(
+                {
                     "version": "4",
                     "status": "firing",
                     "alerts": [
@@ -162,6 +166,19 @@ async def test_cross_agent_a2a_guidance_closed_loop(
                             "annotations": {"summary": f"Guidance alert: {alertname}"},
                         }
                     ],
+                }
+            ).encode("utf-8")
+            wh_sig = hmac.new(
+                settings.alertmanager_webhook_secret.encode("utf-8"),
+                wh_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            wh = await client.post(
+                "/api/v1/webhooks/alertmanager",
+                content=wh_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Alertmanager-Signature": f"sha256={wh_sig}",
                 },
             )
             assert wh.status_code == 200
@@ -169,7 +186,9 @@ async def test_cross_agent_a2a_guidance_closed_loop(
 
             detail = None
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
@@ -183,7 +202,11 @@ async def test_cross_agent_a2a_guidance_closed_loop(
             assert bb["consensus_report"]["agreed_root_cause"] == fault_type
             assert bb["shapley_attribution"]["coalition_count"] == 8
 
-            traces = (await client.get(f"/api/v1/incidents/{incident_id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{incident_id}/traces", headers=viewer_headers
+                )
+            ).json()
             ev_types = [t["event_type"] for t in traces]
             assert "A2A_TASK_DELEGATED" in ev_types
             assert "A2A_TASK_COMPLETED" in ev_types
@@ -197,7 +220,9 @@ async def test_cross_agent_a2a_guidance_closed_loop(
             assert app_resp.status_code == 200
 
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "RESOLVED":
                     break
                 await asyncio.sleep(0.05)
@@ -237,10 +262,14 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             # 1. Discover preview (no DB persistence)
-            disc = await client.post("/api/v1/a2a/peers/discover", json={"base_url": peer_url})
+            disc = await client.post(
+                "/api/v1/a2a/peers/discover",
+                headers=viewer_headers,
+                json={"base_url": peer_url},
+            )
             assert disc.status_code == 200
             assert disc.json()["card"]["name"] == "guidance-rag-neo4j-agent"
-            assert (await client.get("/api/v1/a2a/peers")).json() == []
+            assert (await client.get("/api/v1/a2a/peers", headers=viewer_headers)).json() == []
 
             # 2. Register requires SRE_APPROVER (401 unauth, 403 VIEWER)
             assert (await client.post("/api/v1/a2a/peers", json={"base_url": peer_url})).status_code == 401
@@ -264,6 +293,7 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             # 3. NL parse (preview only, no incident created)
             parse_resp = await client.post(
                 "/api/v1/incidents/nl/parse",
+                headers=viewer_headers,
                 json={"query": "学院智能导学 Neo4j 图谱 Cypher 慢查询超时，请排查"},
             )
             assert parse_resp.status_code == 200
@@ -272,23 +302,33 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             assert draft["matched_runbook"] == "skill.guidance.neo4j_slow_cypher"
             assert draft["target_a2a_peer"] == peer_url
             assert draft["suggested_skill"] == "diagnose_neo4j_cypher"
-            assert (await client.get("/api/v1/incidents")).json() == []
+            assert (await client.get("/api/v1/incidents", headers=viewer_headers)).json() == []
 
             # 4. NL confirm -> creates Incident + NL_INCIDENT_CONFIRMED -> A2A + Consensus + Shapley -> PENDING_APPROVAL
-            confirm_resp = await client.post("/api/v1/incidents/nl/confirm", json=draft)
+            confirm_resp = await client.post(
+                "/api/v1/incidents/nl/confirm",
+                headers=viewer_headers,
+                json=draft,
+            )
             assert confirm_resp.status_code == 201
             incident_id = confirm_resp.json()["id"]
 
             detail = None
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
             assert detail is not None and detail["status"] == "PENDING_APPROVAL"
             assert detail["blackboard"]["a2a_artifacts"]["skill_id"] == "diagnose_neo4j_cypher"
 
-            traces = (await client.get(f"/api/v1/incidents/{incident_id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{incident_id}/traces", headers=viewer_headers
+                )
+            ).json()
             assert any(t["event_type"] == "NL_INCIDENT_CONFIRMED" for t in traces)
             assert any(t["event_type"] == "A2A_TASK_COMPLETED" for t in traces)
 
@@ -300,7 +340,9 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             )
             assert app_resp.status_code == 200
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "RESOLVED":
                     break
                 await asyncio.sleep(0.05)
@@ -350,15 +392,18 @@ async def test_a2a_fault_injection_unreachable_timeout_and_rejected_degrades_saf
         database_url=test_db_url,
         redis_url=test_redis_url,
         start_worker=True,
+        enable_fault_injection=True,
         a2a_client=flaky_client,
         a2a_peer_urls=["http://flaky-peer:8020"],
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
 
     async with LifespanManager(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             inj = await client.post(
                 "/api/v1/incidents/inject",
+                headers=viewer_headers,
                 json={"fault_type": "guidance_neo4j_slow_cypher"},
             )
             assert inj.status_code == 201
@@ -366,7 +411,9 @@ async def test_a2a_fault_injection_unreachable_timeout_and_rejected_degrades_saf
 
             detail = None
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
@@ -376,7 +423,11 @@ async def test_a2a_fault_injection_unreachable_timeout_and_rejected_degrades_saf
             assert detail["blackboard"]["evidence"]["a2a_diagnosis"]["a2a_status"] == "FAILED"
             assert "A2A_TIMEOUT" in detail["blackboard"]["evidence"]["a2a_diagnosis"]["error"]
 
-            traces = (await client.get(f"/api/v1/incidents/{incident_id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{incident_id}/traces", headers=viewer_headers
+                )
+            ).json()
             ev_types = [t["event_type"] for t in traces]
             assert "A2A_TASK_DELEGATED" in ev_types
             assert "A2A_TASK_FAILED" in ev_types
@@ -414,10 +465,14 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             # 1. Discover preview (no DB persistence)
-            disc = await client.post("/api/v1/a2a/peers/discover", json={"base_url": peer_url})
+            disc = await client.post(
+                "/api/v1/a2a/peers/discover",
+                headers=viewer_headers,
+                json={"base_url": peer_url},
+            )
             assert disc.status_code == 200
             assert disc.json()["card"]["name"] == "guidance-rag-neo4j-agent"
-            assert (await client.get("/api/v1/a2a/peers")).json() == []
+            assert (await client.get("/api/v1/a2a/peers", headers=viewer_headers)).json() == []
 
             # 2. Register requires SRE_APPROVER (401 unauth, 403 VIEWER)
             assert (await client.post("/api/v1/a2a/peers", json={"base_url": peer_url})).status_code == 401
@@ -441,6 +496,7 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             # 3. NL parse (preview only, no incident created)
             parse_resp = await client.post(
                 "/api/v1/incidents/nl/parse",
+                headers=viewer_headers,
                 json={"query": "学院智能导学 Neo4j 图谱 Cypher 慢查询超时，请排查"},
             )
             assert parse_resp.status_code == 200
@@ -449,23 +505,33 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             assert draft["matched_runbook"] == "skill.guidance.neo4j_slow_cypher"
             assert draft["target_a2a_peer"] == peer_url
             assert draft["suggested_skill"] == "diagnose_neo4j_cypher"
-            assert (await client.get("/api/v1/incidents")).json() == []
+            assert (await client.get("/api/v1/incidents", headers=viewer_headers)).json() == []
 
             # 4. NL confirm -> creates Incident + NL_INCIDENT_CONFIRMED -> A2A + Consensus + Shapley -> PENDING_APPROVAL
-            confirm_resp = await client.post("/api/v1/incidents/nl/confirm", json=draft)
+            confirm_resp = await client.post(
+                "/api/v1/incidents/nl/confirm",
+                headers=viewer_headers,
+                json=draft,
+            )
             assert confirm_resp.status_code == 201
             incident_id = confirm_resp.json()["id"]
 
             detail = None
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "PENDING_APPROVAL":
                     break
                 await asyncio.sleep(0.05)
             assert detail is not None and detail["status"] == "PENDING_APPROVAL"
             assert detail["blackboard"]["a2a_artifacts"]["skill_id"] == "diagnose_neo4j_cypher"
 
-            traces = (await client.get(f"/api/v1/incidents/{incident_id}/traces")).json()
+            traces = (
+                await client.get(
+                    f"/api/v1/incidents/{incident_id}/traces", headers=viewer_headers
+                )
+            ).json()
             assert any(t["event_type"] == "NL_INCIDENT_CONFIRMED" for t in traces)
             assert any(t["event_type"] == "A2A_TASK_COMPLETED" for t in traces)
 
@@ -477,7 +543,9 @@ async def test_a2a_peer_discover_register_rbac_and_nl_parse_confirm_flow(
             )
             assert app_resp.status_code == 200
             for _ in range(80):
-                detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                detail = (
+                    await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                ).json()
                 if detail["status"] == "RESOLVED":
                     break
                 await asyncio.sleep(0.05)

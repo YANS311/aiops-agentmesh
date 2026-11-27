@@ -336,7 +336,9 @@ async def test_graceful_shutdown_drains_inflight_tasks_and_outbox(
         database_url=os.environ.get("TEST_DATABASE_URL", settings.test_database_url),
         redis_url=os.environ.get("TEST_REDIS_URL", settings.test_redis_url),
         start_worker=True,
+        enable_fault_injection=True,
     )
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
 
     async with LifespanManager(app, shutdown_timeout=30) as manager:
         transport = httpx.ASGITransport(app=manager.app)
@@ -346,7 +348,11 @@ async def test_graceful_shutdown_drains_inflight_tasks_and_outbox(
                 "slow_sql_lock_contention",
                 "redis_cache_stampede",
             ):
-                resp = await client.post("/api/v1/incidents/inject", json={"fault_type": fault_type})
+                resp = await client.post(
+                    "/api/v1/incidents/inject",
+                    headers=viewer_headers,
+                    json={"fault_type": fault_type},
+                )
                 assert resp.status_code == 201
             await asyncio.sleep(0.05)
     # Leaving the context triggers the lifespan graceful shutdown.

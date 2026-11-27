@@ -36,10 +36,12 @@ def create_app(
     start_worker: bool | None = None,
     auto_init_db: bool | None = None,
     tool_execution_mode: str | None = None,
+    enable_fault_injection: bool | None = None,
     a2a_client: A2AClient | None = None,
     a2a_peer_urls: list[str] | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
+    resolved_settings.validate_production_secrets()
     resolved_db_url = database_url or resolved_settings.database_url
     resolved_redis_url = redis_url or resolved_settings.redis_url
     resolved_skills_dir = skills_dir or resolved_settings.skills_dir
@@ -50,6 +52,11 @@ def create_app(
         resolved_settings.embedded_workers if start_worker is None else start_worker
     )
     resolved_tool_mode = tool_execution_mode or resolved_settings.tool_execution_mode
+    resolved_fault_injection = (
+        resolved_settings.enable_fault_injection
+        if enable_fault_injection is None
+        else enable_fault_injection
+    )
     resolved_a2a_peers = (
         resolved_settings.parsed_a2a_peer_urls() if a2a_peer_urls is None else a2a_peer_urls
     )
@@ -95,6 +102,7 @@ def create_app(
             trajectory_consumer=trajectory_consumer if run_embedded else None,
             outbox_relay=outbox_relay,
             lease_seconds=resolved_settings.task_lease_seconds,
+            approval_ttl_seconds=resolved_settings.approval_ttl_seconds,
             a2a_client=resolved_a2a_client,
             a2a_peer_urls=resolved_a2a_peers,
         )
@@ -108,6 +116,7 @@ def create_app(
         )
 
         app.state.settings = resolved_settings
+        app.state.enable_fault_injection = resolved_fault_injection
         app.state.engine = engine
         app.state.session_factory = session_factory
         app.state.redis_client = redis_client

@@ -1,6 +1,9 @@
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
+import json
 import logging
 import time
 from typing import TYPE_CHECKING, Any
@@ -70,13 +73,35 @@ class FailClosedBlockedError(PermissionError):
         self.trace_event = trace_event
 
 
+class ApprovalExpiredError(ConflictStateError):
+    """Raised when an approval has exceeded its TTL and transitioned to EXPIRED."""
+
+
+class PlanHashMismatchError(PermissionError):
+    """Raised Fail-Closed when execution_plan_hash does not match the canonical plan."""
+
+
+def compute_execution_plan_hash(tool_name: str, action_plan: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {"tool_name": tool_name, "action_plan": action_plan},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 __all__ = [
     "AIOpsOrchestrator",
     "AgentWorker",
+    "ApprovalExpiredError",
     "ConflictStateError",
     "FailClosedBlockedError",
     "IncidentNotFoundError",
+    "PlanHashMismatchError",
     "TERMINAL_INCIDENT_STATUSES",
+    "compute_execution_plan_hash",
     "serialize_trace_event",
 ]
 
@@ -96,6 +121,7 @@ class AIOpsOrchestrator:
         trajectory_consumer: "TrajectoryStreamConsumer | None" = None,
         outbox_relay: OutboxRelay | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        approval_ttl_seconds: int = 900,
         a2a_client: A2AClient | None = None,
         a2a_peer_urls: list[str] | None = None,
     ) -> None:
@@ -111,6 +137,7 @@ class AIOpsOrchestrator:
             session_factory=session_factory, redis_bus=redis_bus
         )
         self.lease_seconds = lease_seconds
+        self.approval_ttl_seconds = approval_ttl_seconds
         self.a2a_client = a2a_client or A2AClient()
         self.a2a_peer_urls = list(a2a_peer_urls or [])
         self._worker_wakeups: set[asyncio.Event] = set()
@@ -962,19 +989,25 @@ class AIOpsOrchestrator:
         session.add(executor_task)
         await session.flush()
 
+        action_plan = {
+            "tool_name": proposal.tool_name,
+            "target_resource": incident.service_name,
+            "blast_radius": proposal.blast_radius,
+            "rollback_command": proposal.rollback_command,
+            "rationale": proposal.rationale,
+        }
+        plan_hash = compute_execution_plan_hash(proposal.tool_name, action_plan)
+        expires_at = now + timedelta(seconds=self.approval_ttl_seconds)
+
         approval = RemediationApproval(
             incident_id=incident.id,
             task_id=executor_task.id,
             skill_id=skill.skill_id,
             risk_level=skill.remediation.risk_level,
             proposed_command=proposal.proposed_command,
-            action_plan={
-                "tool_name": proposal.tool_name,
-                "target_resource": incident.service_name,
-                "blast_radius": proposal.blast_radius,
-                "rollback_command": proposal.rollback_command,
-                "rationale": proposal.rationale,
-            },
+            action_plan=action_plan,
+            execution_plan_hash=plan_hash,
+            expires_at=expires_at,
             status="PENDING",
         )
         session.add(approval)
@@ -1215,49 +1248,111 @@ class AIOpsOrchestrator:
                         )
 
                     now = datetime.now(timezone.utc)
-                    approval.status = "APPROVED"
-                    approval.approved_by = approved_by
-                    approval.approved_by_role = approved_by_role
-                    approval.approval_comment = comment
-                    approval.decided_at = now
+                    expired_err: ApprovalExpiredError | None = None
+                    tampered_err: PlanHashMismatchError | None = None
+                    blackboard_copy = dict(incident.blackboard or {})
 
-                    incident.status = "EXECUTING_REMEDIATION"
-                    bb = dict(incident.blackboard or {})
-                    bb["stage"] = "EXECUTING_REMEDIATION"
-                    incident.blackboard = bb
-                    flag_modified(incident, "blackboard")
-                    incident.version += 1
-
-                    exec_task = (
-                        await session.execute(
-                            select(AgentTask)
-                            .where(AgentTask.id == approval.task_id)
-                            .with_for_update()
+                    if approval.expires_at is not None and now > approval.expires_at:
+                        approval.status = "EXPIRED"
+                        incident.status = "EXPIRED"
+                        blackboard_copy["stage"] = "EXPIRED"
+                        incident.blackboard = blackboard_copy
+                        flag_modified(incident, "blackboard")
+                        incident.version += 1
+                        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="APPROVAL_EXPIRED").inc()
+                        pending_events.append(
+                            await append_trace_event(
+                                session,
+                                incident_id=incident.id,
+                                agent_role="POLICY_GATE",
+                                event_type="APPROVAL_EXPIRED",
+                                risk_tier="HIGH_RISK_WRITE",
+                                summary="Approval TTL expired before sign-off; transitioned to EXPIRED.",
+                                payload={
+                                    "approval_id": str(approval.id),
+                                    "expires_at": approval.expires_at.isoformat(),
+                                    "actor_id": approved_by,
+                                },
+                            )
                         )
-                    ).scalar_one()
-                    exec_task.status = "QUEUED"
-
-                    pending_events.append(
-                        await append_trace_event(
-                            session,
-                            incident_id=incident.id,
-                            agent_role="HUMAN_OPERATOR",
-                            event_type="APPROVAL_GRANTED",
-                            risk_tier="HIGH_RISK_WRITE",
-                            summary=f"Operator {approved_by} ({approved_by_role}) approved high-risk remediation execution.",
-                            payload={
-                                "actor_id": approved_by,
-                                "actor_role": approved_by_role,
-                                "approved_by": approved_by,
-                                "comment": comment or "",
-                                "approval_id": str(approval.id),
-                            },
+                        expired_err = ApprovalExpiredError(
+                            f"Approval {approval.id} expired at {approval.expires_at.isoformat()}."
                         )
-                    )
-                    blackboard_copy = dict(incident.blackboard)
-            logger.info("Remediation approved by %s (%s)", approved_by, approved_by_role)
+                    else:
+                        tool_name = str((approval.action_plan or {}).get("tool_name", ""))
+                        recomputed_hash = compute_execution_plan_hash(
+                            tool_name, approval.action_plan or {}
+                        )
+                        if approval.execution_plan_hash and not hmac.compare_digest(
+                            recomputed_hash, approval.execution_plan_hash
+                        ):
+                            FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="PLAN_HASH_MISMATCH").inc()
+                            pending_events.append(
+                                await append_trace_event(
+                                    session,
+                                    incident_id=incident.id,
+                                    agent_role="POLICY_GATE",
+                                    event_type="PLAN_HASH_MISMATCH",
+                                    risk_tier="HIGH_RISK_WRITE",
+                                    summary="Fail-Closed: approval execution_plan_hash mismatch detected.",
+                                    payload={
+                                        "approval_id": str(approval.id),
+                                        "expected_hash": approval.execution_plan_hash,
+                                        "actual_hash": recomputed_hash,
+                                        "actor_id": approved_by,
+                                    },
+                                )
+                            )
+                            tampered_err = PlanHashMismatchError(
+                                "Approval execution_plan_hash mismatch: action_plan was tampered."
+                            )
+                        else:
+                            approval.status = "APPROVED"
+                            approval.approved_by = approved_by
+                            approval.approved_by_role = approved_by_role
+                            approval.approval_comment = comment
+                            approval.decided_at = now
+
+                            incident.status = "EXECUTING_REMEDIATION"
+                            blackboard_copy["stage"] = "EXECUTING_REMEDIATION"
+                            incident.blackboard = blackboard_copy
+                            flag_modified(incident, "blackboard")
+                            incident.version += 1
+
+                            exec_task = (
+                                await session.execute(
+                                    select(AgentTask)
+                                    .where(AgentTask.id == approval.task_id)
+                                    .with_for_update()
+                                )
+                            ).scalar_one()
+                            exec_task.status = "QUEUED"
+
+                            pending_events.append(
+                                await append_trace_event(
+                                    session,
+                                    incident_id=incident.id,
+                                    agent_role="HUMAN_OPERATOR",
+                                    event_type="APPROVAL_GRANTED",
+                                    risk_tier="HIGH_RISK_WRITE",
+                                    summary=f"Operator {approved_by} ({approved_by_role}) approved high-risk remediation execution.",
+                                    payload={
+                                        "actor_id": approved_by,
+                                        "actor_role": approved_by_role,
+                                        "approved_by": approved_by,
+                                        "comment": comment or "",
+                                        "approval_id": str(approval.id),
+                                        "execution_plan_hash": approval.execution_plan_hash,
+                                    },
+                                )
+                            )
 
         await self._publish_pending(incident_id, pending_events, blackboard_copy)
+        if expired_err is not None:
+            raise expired_err
+        if tampered_err is not None:
+            raise tampered_err
+        logger.info("Remediation approved by %s (%s)", approved_by, approved_by_role)
         self.notify_worker()
         async with self.session_factory() as read_sess:
             refreshed = await get_incident_full(read_sess, incident_id)
@@ -1360,6 +1455,8 @@ class AIOpsOrchestrator:
         pending_events: list[TraceEvent] = []
         blocked_exc: ApprovalRequiredError | PolicyViolationError | None = None
         blocked_trace: TraceEvent | None = None
+        expired_direct_err: ApprovalExpiredError | None = None
+        tampered_direct_err: PlanHashMismatchError | None = None
         blackboard_copy: dict[str, Any] | None = None
 
         with bind_log_context(
@@ -1414,20 +1511,77 @@ class AIOpsOrchestrator:
                         logger.warning("Direct /execute blocked Fail-Closed for actor=%s", actor_id)
                     else:
                         assert approval is not None
-                        exec_task = (
-                            await session.execute(
-                                select(AgentTask)
-                                .where(AgentTask.id == approval.task_id)
-                                .with_for_update()
+                        now = datetime.now(timezone.utc)
+                        if approval.expires_at is not None and now > approval.expires_at:
+                            approval.status = "EXPIRED"
+                            incident.status = "EXPIRED"
+                            bb = dict(incident.blackboard or {})
+                            bb["stage"] = "EXPIRED"
+                            incident.blackboard = bb
+                            flag_modified(incident, "blackboard")
+                            incident.version += 1
+                            FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="APPROVAL_EXPIRED").inc()
+                            pending_events.append(
+                                await append_trace_event(
+                                    session,
+                                    incident_id=incident.id,
+                                    agent_role="POLICY_GATE",
+                                    event_type="APPROVAL_EXPIRED",
+                                    risk_tier="HIGH_RISK_WRITE",
+                                    summary="Approval TTL expired before /execute; transitioned to EXPIRED.",
+                                    payload={"approval_id": str(approval.id)},
+                                )
                             )
-                        ).scalar_one()
-                        if exec_task.status != "COMPLETED":
-                            await self._execute_approved_remediation(
-                                session, incident, exec_task, approval, pending_events
+                            blackboard_copy = dict(incident.blackboard or {})
+                            expired_direct_err = ApprovalExpiredError(
+                                f"Approval {approval.id} expired at {approval.expires_at.isoformat()}."
                             )
-                        blackboard_copy = dict(incident.blackboard or {})
+                        else:
+                            recomputed_hash = compute_execution_plan_hash(
+                                tool_name, approval.action_plan or {}
+                            )
+                            if approval.execution_plan_hash and not hmac.compare_digest(
+                                recomputed_hash, approval.execution_plan_hash
+                            ):
+                                FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="PLAN_HASH_MISMATCH").inc()
+                                pending_events.append(
+                                    await append_trace_event(
+                                        session,
+                                        incident_id=incident.id,
+                                        agent_role="POLICY_GATE",
+                                        event_type="PLAN_HASH_MISMATCH",
+                                        risk_tier="HIGH_RISK_WRITE",
+                                        summary="Fail-Closed: execution_plan_hash mismatch detected on /execute.",
+                                        payload={
+                                            "approval_id": str(approval.id),
+                                            "expected_hash": approval.execution_plan_hash,
+                                            "actual_hash": recomputed_hash,
+                                        },
+                                    )
+                                )
+                                blackboard_copy = dict(incident.blackboard or {})
+                                tampered_direct_err = PlanHashMismatchError(
+                                    "Approval execution_plan_hash mismatch: action_plan was tampered."
+                                )
+                            else:
+                                exec_task = (
+                                    await session.execute(
+                                        select(AgentTask)
+                                        .where(AgentTask.id == approval.task_id)
+                                        .with_for_update()
+                                    )
+                                ).scalar_one()
+                                if exec_task.status != "COMPLETED":
+                                    await self._execute_approved_remediation(
+                                        session, incident, exec_task, approval, pending_events
+                                    )
+                                blackboard_copy = dict(incident.blackboard or {})
 
         await self._publish_pending(incident_id, pending_events, blackboard_copy)
+        if expired_direct_err is not None:
+            raise expired_direct_err
+        if tampered_direct_err is not None:
+            raise tampered_direct_err
         if blocked_exc is not None:
             assert blocked_trace is not None
             raise FailClosedBlockedError(str(blocked_exc), blocked_trace)

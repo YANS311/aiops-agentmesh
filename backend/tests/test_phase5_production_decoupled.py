@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import json
 import os
 
 from asgi_lifespan import LifespanManager
@@ -58,11 +61,29 @@ async def test_alertmanager_webhook_and_concurrent_storm_deduplication(
         ],
     }
 
+    raw_payload = json.dumps(payload).encode("utf-8")
+    sig = hmac.new(
+        settings.alertmanager_webhook_secret.encode("utf-8"),
+        raw_payload,
+        hashlib.sha256,
+    ).hexdigest()
+    wh_headers = {
+        "Content-Type": "application/json",
+        "X-Alertmanager-Signature": f"sha256={sig}",
+    }
+
     async with LifespanManager(app) as manager:
         transport = httpx.ASGITransport(app=manager.app)
         async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             responses = await asyncio.gather(
-                *(client.post("/api/v1/webhooks/alertmanager", json=payload) for _ in range(10))
+                *(
+                    client.post(
+                        "/api/v1/webhooks/alertmanager",
+                        content=raw_payload,
+                        headers=wh_headers,
+                    )
+                    for _ in range(10)
+                )
             )
 
             assert all(r.status_code == 200 for r in responses)
@@ -76,12 +97,24 @@ async def test_alertmanager_webhook_and_concurrent_storm_deduplication(
             assert max(item["dedup_count"] for item in items) == 10
 
             # Resolved alert status should be ignored cleanly
-            resolved_resp = await client.post(
-                "/api/v1/webhooks/alertmanager",
-                json={
+            resolved_bytes = json.dumps(
+                {
                     "version": "4",
                     "status": "resolved",
                     "alerts": [{"status": "resolved", "fingerprint": "fp-storm-pg16-001"}],
+                }
+            ).encode("utf-8")
+            resolved_sig = hmac.new(
+                settings.alertmanager_webhook_secret.encode("utf-8"),
+                resolved_bytes,
+                hashlib.sha256,
+            ).hexdigest()
+            resolved_resp = await client.post(
+                "/api/v1/webhooks/alertmanager",
+                content=resolved_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-Alertmanager-Signature": f"sha256={resolved_sig}",
                 },
             )
             assert resolved_resp.status_code == 200
@@ -204,15 +237,15 @@ async def test_decoupled_api_worker_relay_end_to_end_closed_loop(
         )
     )
 
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
     approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
     try:
         async with LifespanManager(app) as manager:
             assert app.state.embedded_workers is False
             transport = httpx.ASGITransport(app=manager.app)
             async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
-                wh = await client.post(
-                    "/api/v1/webhooks/alertmanager",
-                    json={
+                wh_body = json.dumps(
+                    {
                         "version": "4",
                         "status": "firing",
                         "alerts": [
@@ -228,6 +261,19 @@ async def test_decoupled_api_worker_relay_end_to_end_closed_loop(
                                 "annotations": {"summary": "Decoupled E2E Pool Exhausted"},
                             }
                         ],
+                    }
+                ).encode("utf-8")
+                wh_sig = hmac.new(
+                    settings.alertmanager_webhook_secret.encode("utf-8"),
+                    wh_body,
+                    hashlib.sha256,
+                ).hexdigest()
+                wh = await client.post(
+                    "/api/v1/webhooks/alertmanager",
+                    content=wh_body,
+                    headers={
+                        "Content-Type": "application/json",
+                        "X-Alertmanager-Signature": f"sha256={wh_sig}",
                     },
                 )
                 assert wh.status_code == 200
@@ -236,7 +282,9 @@ async def test_decoupled_api_worker_relay_end_to_end_closed_loop(
                 # Wait for standalone worker to reach PENDING_APPROVAL
                 detail = None
                 for _ in range(80):
-                    detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                    detail = (
+                        await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                    ).json()
                     if detail["status"] == "PENDING_APPROVAL":
                         break
                     await asyncio.sleep(0.05)
@@ -253,7 +301,9 @@ async def test_decoupled_api_worker_relay_end_to_end_closed_loop(
                 assert app_resp.status_code == 200
 
                 for _ in range(80):
-                    detail = (await client.get(f"/api/v1/incidents/{incident_id}")).json()
+                    detail = (
+                        await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
+                    ).json()
                     if detail["status"] == "RESOLVED":
                         break
                     await asyncio.sleep(0.05)

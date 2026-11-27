@@ -1,5 +1,7 @@
 import hashlib
+import hmac
 import json
+import logging
 from typing import Any
 from urllib.parse import urlparse
 from uuid import UUID, uuid4
@@ -13,9 +15,11 @@ from app.a2a.models import AgentCard, AgentCapabilities, AgentSkillCard
 from app.agents.orchestrator import (
     TERMINAL_INCIDENT_STATUSES,
     AIOpsOrchestrator,
+    ApprovalExpiredError,
     ConflictStateError,
     FailClosedBlockedError,
     IncidentNotFoundError,
+    PlanHashMismatchError,
     serialize_trace_event,
 )
 from app.api.schemas import (
@@ -42,6 +46,7 @@ from app.api.schemas import (
 )
 from app.auth.rbac import Actor, require_authenticated, require_sre_approver
 from app.db.models import A2APeer, Incident
+from app.observability.metrics import FAIL_CLOSED_BLOCKS_TOTAL
 from app.db.repositories import (
     get_incident_full,
     get_trajectory_by_incident,
@@ -51,6 +56,7 @@ from app.db.repositories import (
 )
 from app.redis_bus.events import incident_events_stream
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["aiops"])
 
 
@@ -88,7 +94,9 @@ def _validate_peer_base_url(raw_url: str) -> str:
 
 @router.post("/a2a/peers/discover", response_model=A2APeerDiscoverResponse)
 async def discover_a2a_peer(
-    body: A2APeerDiscoverRequest, request: Request
+    body: A2APeerDiscoverRequest,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
 ) -> A2APeerDiscoverResponse:
     base_url = _validate_peer_base_url(body.base_url)
     a2a_client = request.app.state.a2a_client
@@ -160,7 +168,10 @@ async def register_a2a_peer(
 
 
 @router.get("/a2a/peers", response_model=list[A2APeerOut])
-async def list_a2a_peers(request: Request) -> list[A2APeerOut]:
+async def list_a2a_peers(
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> list[A2APeerOut]:
     a2a_client = request.app.state.a2a_client
     env_urls: list[str] = request.app.state.a2a_peer_urls
 
@@ -264,7 +275,10 @@ async def delete_a2a_peer(
 
 
 @router.get("/skills", response_model=list[SkillOut])
-async def get_skills(request: Request) -> list[SkillOut]:
+async def get_skills(
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> list[SkillOut]:
     skills = request.app.state.skill_registry.list_skills()
     return [
         SkillOut(
@@ -286,7 +300,20 @@ async def get_skills(request: Request) -> list[SkillOut]:
 
 
 @router.post("/incidents/inject", response_model=IncidentSummaryOut, status_code=status.HTTP_201_CREATED)
-async def inject_incident(body: InjectIncidentRequest, request: Request) -> IncidentSummaryOut:
+async def inject_incident(
+    body: InjectIncidentRequest,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> IncidentSummaryOut:
+    if not bool(getattr(request.app.state, "enable_fault_injection", False)):
+        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="FAULT_INJECTION_DISABLED").inc()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "FAULT_INJECTION_DISABLED",
+                "message": "Fault injection endpoint is disabled (ENABLE_FAULT_INJECTION=false).",
+            },
+        )
     orch = _get_orchestrator(request)
     incident = await orch.inject_incident(
         fault_type=body.fault_type,
@@ -301,10 +328,12 @@ async def inject_incident(body: InjectIncidentRequest, request: Request) -> Inci
 
 @router.post("/incidents/nl/parse", response_model=NLParseResponse)
 async def parse_nl_incident_intent(
-    body: NLParseRequest, request: Request
+    body: NLParseRequest,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
 ) -> NLParseResponse:
     orch = _get_orchestrator(request)
-    peers = await list_a2a_peers(request)
+    peers = await list_a2a_peers(request, actor)
     available_peers = [
         {"base_url": p.base_url, "card": p.card}
         for p in peers
@@ -329,7 +358,9 @@ async def parse_nl_incident_intent(
 
 @router.post("/incidents/nl/confirm", response_model=IncidentSummaryOut, status_code=status.HTTP_201_CREATED)
 async def confirm_nl_incident_intent(
-    body: NLConfirmRequest, request: Request
+    body: NLConfirmRequest,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
 ) -> IncidentSummaryOut:
     orch = _get_orchestrator(request)
     incident = await orch.confirm_nl_incident(
@@ -371,10 +402,46 @@ def _normalize_severity(raw: str | None) -> str | None:
     return mapping.get(upper, "P1")
 
 
+def _verify_alertmanager_hmac(raw_body: bytes, signature_header: str, secret: str) -> None:
+    sig = signature_header.strip()
+    if not sig:
+        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="WEBHOOK_SIGNATURE_MISSING").inc()
+        logger.warning("Alertmanager webhook rejected: missing X-Alertmanager-Signature header")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={
+                "code": "WEBHOOK_SIGNATURE_MISSING",
+                "message": "Missing X-Alertmanager-Signature HMAC-SHA256 header.",
+            },
+        )
+    provided = sig[7:].strip() if sig.lower().startswith("sha256=") else sig
+    expected = hmac.new(secret.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(provided.lower(), expected.lower()):
+        FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="WEBHOOK_SIGNATURE_INVALID").inc()
+        logger.warning("Security audit: Alertmanager webhook HMAC-SHA256 verification failed")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "code": "WEBHOOK_SIGNATURE_INVALID",
+                "message": "Invalid X-Alertmanager-Signature HMAC-SHA256 digest.",
+            },
+        )
+
+
 @router.post("/webhooks/alertmanager", response_model=AlertmanagerWebhookResponse)
-async def alertmanager_webhook(
-    body: AlertmanagerWebhookPayload, request: Request
-) -> AlertmanagerWebhookResponse:
+async def alertmanager_webhook(request: Request) -> AlertmanagerWebhookResponse:
+    raw_body = await request.body()
+    secret = request.app.state.settings.alertmanager_webhook_secret
+    _verify_alertmanager_hmac(
+        raw_body,
+        request.headers.get("x-alertmanager-signature", ""),
+        secret,
+    )
+    try:
+        body = AlertmanagerWebhookPayload.model_validate_json(raw_body)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid Alertmanager payload: {exc}") from exc
+
     orch = _get_orchestrator(request)
     results: list[AlertmanagerItemResult] = []
     for alert in body.alerts:
@@ -435,6 +502,7 @@ async def get_incidents(
     request: Request,
     fault_type: str | None = Query(default=None),
     blackboard_contains: str | None = Query(default=None),
+    actor: Actor = Depends(require_authenticated),
 ) -> list[IncidentSummaryOut]:
     parsed_bb: dict[str, Any] | None = None
     if blackboard_contains:
@@ -451,7 +519,11 @@ async def get_incidents(
 
 
 @router.get("/incidents/{incident_id}", response_model=IncidentDetailOut)
-async def get_incident_detail(incident_id: UUID, request: Request) -> IncidentDetailOut:
+async def get_incident_detail(
+    incident_id: UUID,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> IncidentDetailOut:
     async with request.app.state.session_factory() as session:
         incident = await get_incident_full(session, incident_id)
     if incident is None:
@@ -464,6 +536,7 @@ async def get_incident_traces(
     incident_id: UUID,
     request: Request,
     after_id: int = Query(default=0, ge=0),
+    actor: Actor = Depends(require_authenticated),
 ) -> list[TraceEventOut]:
     async with request.app.state.session_factory() as session:
         exists = (
@@ -480,6 +553,7 @@ async def stream_incident_events(
     incident_id: UUID,
     request: Request,
     after_id: int = Query(default=0, ge=0),
+    actor: Actor = Depends(require_authenticated),
 ) -> StreamingResponse:
     session_factory = request.app.state.session_factory
     redis_bus = request.app.state.redis_bus
@@ -605,6 +679,16 @@ async def approve_incident(
         )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "APPROVAL_EXPIRED", "message": str(exc)},
+        ) from exc
+    except PlanHashMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "PLAN_HASH_MISMATCH", "message": str(exc)},
+        ) from exc
     except ConflictStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return IncidentDetailOut.model_validate(incident)
@@ -627,6 +711,16 @@ async def reject_incident(
         )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "APPROVAL_EXPIRED", "message": str(exc)},
+        ) from exc
+    except PlanHashMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "PLAN_HASH_MISMATCH", "message": str(exc)},
+        ) from exc
     except ConflictStateError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return IncidentDetailOut.model_validate(incident)
@@ -647,6 +741,16 @@ async def execute_incident_remediation(
         )
     except IncidentNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ApprovalExpiredError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": "APPROVAL_EXPIRED", "message": str(exc)},
+        ) from exc
+    except PlanHashMismatchError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"code": "PLAN_HASH_MISMATCH", "message": str(exc)},
+        ) from exc
     except FailClosedBlockedError as exc:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -660,14 +764,21 @@ async def execute_incident_remediation(
 
 
 @router.get("/trajectories", response_model=list[TrajectoryOut])
-async def get_trajectories(request: Request) -> list[TrajectoryOut]:
+async def get_trajectories(
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> list[TrajectoryOut]:
     async with request.app.state.session_factory() as session:
         rows = await list_trajectories(session)
     return [TrajectoryOut.model_validate(r) for r in rows]
 
 
 @router.get("/trajectories/{incident_id}", response_model=TrajectoryOut)
-async def get_trajectory(incident_id: UUID, request: Request) -> TrajectoryOut:
+async def get_trajectory(
+    incident_id: UUID,
+    request: Request,
+    actor: Actor = Depends(require_authenticated),
+) -> TrajectoryOut:
     async with request.app.state.session_factory() as session:
         row = await get_trajectory_by_incident(session, incident_id)
     if row is None:

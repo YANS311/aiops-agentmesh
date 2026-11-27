@@ -24,7 +24,11 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
         database_url=test_db_url,
         redis_url=test_redis_url,
         start_worker=True,
+        enable_fault_injection=True,
     )
+
+    viewer_headers = {"Authorization": f"Bearer {settings.rbac_viewer_token}"}
+    approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
 
     async with LifespanManager(app) as manager:
         transport = httpx.ASGITransport(app=manager.app)
@@ -33,13 +37,14 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
             assert health.status_code == 200
             assert health.json() == {"status": "ok", "postgres": "ok", "redis": "ok"}
 
-            skills_resp = await client.get("/api/v1/skills")
+            skills_resp = await client.get("/api/v1/skills", headers=viewer_headers)
             assert skills_resp.status_code == 200
             assert len(skills_resp.json()) == 5
 
             # 1. Inject fault incident
             inject_resp = await client.post(
                 "/api/v1/incidents/inject",
+                headers=viewer_headers,
                 json={"fault_type": "db_connection_pool_exhausted"},
             )
             assert inject_resp.status_code == 201
@@ -48,7 +53,7 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
             # 2. Wait for background worker to reach PENDING_APPROVAL
             detail = None
             for _ in range(50):
-                r = await client.get(f"/api/v1/incidents/{incident_id}")
+                r = await client.get(f"/api/v1/incidents/{incident_id}", headers=viewer_headers)
                 assert r.status_code == 200
                 detail = r.json()
                 if detail["status"] == "PENDING_APPROVAL":
@@ -59,7 +64,6 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
             assert detail["approval"]["status"] == "PENDING"
 
             # 3. Attempt unauthorized /execute (authenticated SRE_APPROVER, but approval still PENDING) -> MUST return 403 Fail-Closed
-            approver_headers = {"Authorization": f"Bearer {settings.rbac_approver_token}"}
             exec_resp = await client.post(
                 f"/api/v1/incidents/{incident_id}/execute",
                 headers=approver_headers,
@@ -81,7 +85,9 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
 
             async def consume_sse() -> None:
                 async with client.stream(
-                    "GET", f"/api/v1/incidents/{incident_id}/events"
+                    "GET",
+                    f"/api/v1/incidents/{incident_id}/events",
+                    headers=viewer_headers,
                 ) as sse_resp:
                     assert sse_resp.status_code == 200
                     current_event = "message"
@@ -108,12 +114,15 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
             assert received_events[-1] == ("complete", {"status": "RESOLVED"})
 
             # 5. Verify trajectory endpoint & JSONB containment filter
-            traj_resp = await client.get(f"/api/v1/trajectories/{incident_id}")
+            traj_resp = await client.get(
+                f"/api/v1/trajectories/{incident_id}", headers=viewer_headers
+            )
             assert traj_resp.status_code == 200
             assert traj_resp.json()["skill_id"] == "skill.pg16.pool_exhaustion"
 
             list_resp = await client.get(
                 "/api/v1/incidents",
+                headers=viewer_headers,
                 params={"blackboard_contains": json.dumps({"stage": "RESOLVED"})},
             )
             assert list_resp.status_code == 200

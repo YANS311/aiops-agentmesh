@@ -6,7 +6,7 @@
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
 > **Automated CI/CD Pipeline**:
-> - **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 39-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> - **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with three parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 43-test `pytest -v`), `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`), and `security-ci` (`gitleaks/gitleaks-action@v2` full-history secret scan).
 > - **CD** ([.github/workflows/cd.yml](.github/workflows/cd.yml)): Triggered on `v*` release tags to build and push multi-service container images (`backend` & `frontend`) to **GitHub Container Registry (GHCR)** and publish the **GitHub Release** with `docker-compose.prod.yml`.
 
 ## Architecture Highlights
@@ -25,6 +25,11 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
   - **Prometheus `/metrics`**: exposes `aiops_incidents_total`, `aiops_task_duration_seconds`, `aiops_fail_closed_blocks_total`, `aiops_outbox_pending_events`, and `aiops_dead_letter_tasks_total`.
   - **JSON Structured Logging**: unified JSON log formatter automatically carrying `incident_id`, `task_id`, `actor_id`, and `actor_role`.
   - **Graceful Shutdown**: FastAPI `lifespan` stops claiming new tasks, drains in-flight worker tasks and flushes pending `outbox_events` (bounded by `SHUTDOWN_TIMEOUT_SECONDS`) before closing Redis and PG16 connection pools.
+- **Security Hardening, Zero-Unauth Routes & Tamper-Proof Approvals (`Phase 6 Part 2`)**:
+  - **All-Route Auth & RBAC**: Only `GET /api/v1/health` and `GET /.well-known/agent.json` are public; all business reads, NL parse/confirm, A2A discovery, and SSE streams require at least `VIEWER` Bearer auth (`401 AUTH_REQUIRED`), while approvals/rejections/executions and A2A peer mutations require `SRE_APPROVER` (`403 RBAC_FORBIDDEN`).
+  - **Alertmanager HMAC-SHA256**: `POST /api/v1/webhooks/alertmanager` verifies `X-Alertmanager-Signature` against `ALERTMANAGER_WEBHOOK_SECRET` using constant-time `hmac.compare_digest` (`401` missing / `403 WEBHOOK_SIGNATURE_INVALID`).
+  - **Fault-Injection Isolation & Approval Anti-Tampering**: `ENABLE_FAULT_INJECTION=false` blocks `/api/v1/incidents/inject` with `403 FAULT_INJECTION_DISABLED`; `remediation_approvals` binds canonical SHA-256 `execution_plan_hash` (`403 PLAN_HASH_MISMATCH`) and `expires_at` (`409 APPROVAL_EXPIRED`) via Alembic `0004_approval_hash_and_ttl`.
+  - **Fail-Fast Secrets Governance**: `APP_ENV=production` rejects missing or weak/demo secrets at startup; `docker-compose.prod.yml` enforces required `${VAR:?}` injection with zero hardcoded passwords.
 - **Truthfulness Isolation & Independent Post-Check (`Phase 6 Part 1`)**:
   - Strongly-typed `EvidenceSource` (`MOCK` | `LIVE`) and `ExecutionOutcome` (`SIMULATED` | `VERIFIED` | `UNKNOWN` | `FAILED`) in `backend/app/agents/semantics.py`.
   - In `TOOL_EXECUTION_MODE=live`, log probes return `evidence_source="LIVE"`, `log_source_available=false`, `entries=[]` with zero synthetic fabrication when no live log backend is configured.
