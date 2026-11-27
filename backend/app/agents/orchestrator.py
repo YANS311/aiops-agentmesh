@@ -11,6 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.agents.consensus import run_parallel_diagnosis_and_attribution
 from app.agents.llm import LLMProvider, MalformedLLMOutputError
 from app.agents.reliability import OutboxRelay
 from app.agents.tools import (
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-TERMINAL_INCIDENT_STATUSES = {"RESOLVED", "REJECTED", "FAILED"}
+TERMINAL_INCIDENT_STATUSES = {"RESOLVED", "REJECTED", "FAILED", "NEEDS_HUMAN_REVIEW"}
 
 
 class IncidentNotFoundError(LookupError):
@@ -568,6 +569,78 @@ class AIOpsOrchestrator:
             raise MalformedLLMOutputError(f"Missing skill for {incident.fault_type}")
 
         evidence = dict((incident.blackboard or {}).get("evidence") or {})
+        consensus_report, shapley_report = await run_parallel_diagnosis_and_attribution(
+            llm_provider=self.llm,
+            fault_type=incident.fault_type,
+            service_name=incident.service_name,
+            evidence=evidence,
+            alert_payload=incident.alert_payload or {},
+            skill=skill,
+        )
+
+        bb = dict(incident.blackboard or {})
+        bb["consensus_report"] = consensus_report.to_json_dict()
+        bb["shapley_attribution"] = shapley_report.to_json_dict()
+
+        if consensus_report.status == "CONFLICT_FAIL_CLOSED":
+            FAIL_CLOSED_BLOCKS_TOTAL.labels(reason="CONSENSUS_CONFLICT_BLOCKED").inc()
+            now = datetime.now(timezone.utc)
+            bb["stage"] = "NEEDS_HUMAN_REVIEW"
+            incident.blackboard = bb
+            flag_modified(incident, "blackboard")
+            incident.root_cause_summary = consensus_report.reason
+            incident.status = "NEEDS_HUMAN_REVIEW"
+            incident.version += 1
+
+            task.status = "FAILED"
+            task.error_message = consensus_report.reason
+            task.output_payload = {
+                "consensus_report": bb["consensus_report"],
+                "shapley_attribution": bb["shapley_attribution"],
+            }
+            task.completed_at = now
+            await session.flush()
+
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="CONSENSUS_ARBITER",
+                    event_type="CONSENSUS_CONFLICT_ALERT",
+                    risk_tier="HIGH_RISK_WRITE",
+                    summary=consensus_report.reason,
+                    payload={
+                        "consensus_report": bb["consensus_report"],
+                        "shapley_attribution": bb["shapley_attribution"],
+                    },
+                )
+            )
+            logger.warning(
+                "Consensus Arbiter Fail-Closed block: disagreement=%.3f confidence=%.3f",
+                consensus_report.disagreement_score,
+                consensus_report.consensus_confidence,
+            )
+            return
+
+        pending_events.append(
+            await append_trace_event(
+                session,
+                incident_id=incident.id,
+                agent_role="CONSENSUS_ARBITER",
+                event_type="CONSENSUS_REACHED",
+                risk_tier="READ_ONLY",
+                summary=consensus_report.reason,
+                payload={
+                    "agreed_root_cause": consensus_report.agreed_root_cause,
+                    "consensus_confidence": consensus_report.consensus_confidence,
+                    "agreement_ratio": consensus_report.agreement_ratio,
+                    "shapley_shares": {
+                        a.agent_id: a.normalized_share for a in shapley_report.attributions
+                    },
+                },
+            )
+        )
+
         proposal = await self.llm.propose_remediation(
             fault_type=incident.fault_type,
             service_name=incident.service_name,
@@ -577,7 +650,6 @@ class AIOpsOrchestrator:
         )
 
         incident.root_cause_summary = proposal.root_cause_summary
-        bb = dict(incident.blackboard or {})
         bb["stage"] = "PENDING_APPROVAL"
         bb["remediation_proposal"] = {
             "tool_name": proposal.tool_name,

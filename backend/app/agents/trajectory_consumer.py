@@ -131,6 +131,8 @@ class TrajectoryStreamConsumer:
                         "skill_id": skill_id,
                         "root_cause": incident.root_cause_summary or "",
                         "evidence": (incident.blackboard or {}).get("evidence", {}),
+                        "consensus_report": (incident.blackboard or {}).get("consensus_report"),
+                        "shapley_attribution": (incident.blackboard or {}).get("shapley_attribution"),
                         "approval_audit": {
                             "approval_id": str(approval.id) if approval else None,
                             "approved_by": approval.approved_by if approval else None,

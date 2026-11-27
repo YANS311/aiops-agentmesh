@@ -5,6 +5,7 @@ from typing import Any, Protocol
 import httpx
 from pydantic import BaseModel, Field, ValidationError
 
+from app.agents.shapley import DiagnosticHypothesis
 from app.config import Settings
 from app.skills.loader import RunbookSkill
 
@@ -56,6 +57,12 @@ class _RemediationProposalSchema(BaseModel):
     rationale: str = Field(min_length=1)
 
 
+class _SpecialistHypothesisSchema(BaseModel):
+    root_cause_label: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    evidence_summary: str = Field(min_length=1)
+
+
 class LLMProvider(Protocol):
     async def plan_triage(
         self, *, fault_type: str, service_name: str, alert_payload: dict[str, Any], skill: RunbookSkill
@@ -64,6 +71,17 @@ class LLMProvider(Protocol):
     async def plan_diagnostic_step(
         self, *, agent_role: str, alert_payload: dict[str, Any], skill: RunbookSkill
     ) -> DiagnosticPlan: ...
+
+    async def diagnose_specialist_hypothesis(
+        self,
+        *,
+        agent_id: str,
+        fault_type: str,
+        service_name: str,
+        evidence: dict[str, Any],
+        alert_payload: dict[str, Any],
+        skill: RunbookSkill,
+    ) -> DiagnosticHypothesis: ...
 
     async def propose_remediation(
         self,
@@ -232,6 +250,45 @@ class OpenAICompatibleLLMProvider:
             reasoning=validated.reasoning,
         )
 
+    async def diagnose_specialist_hypothesis(
+        self,
+        *,
+        agent_id: str,
+        fault_type: str,
+        service_name: str,
+        evidence: dict[str, Any],
+        alert_payload: dict[str, Any],
+        skill: RunbookSkill,
+    ) -> DiagnosticHypothesis:
+        system_prompt = (
+            f"你是 {agent_id} 专业诊断智能体。请基于当前故障上下文、只读遥测证据与匹配的 Runbook Skill 独立给出根因假设。"
+            "仅输出一个 JSON 对象，包含以下键："
+            '"root_cause_label"（标准英文故障标签，如 db_connection_pool_exhausted）、'
+            '"confidence"（0.0 到 1.0 之间的浮点数置信度）、'
+            '"evidence_summary"（使用简体中文简述支持该假设的关键证据）。'
+        )
+        user_payload = {
+            "agent_id": agent_id,
+            "fault_type": fault_type,
+            "service_name": service_name,
+            "evidence": evidence,
+            "alert_payload": alert_payload,
+            "skill_id": skill.skill_id,
+        }
+        validated = await self._complete_json(
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            schema=_SpecialistHypothesisSchema,
+        )
+        assert isinstance(validated, _SpecialistHypothesisSchema)
+        return DiagnosticHypothesis(
+            agent_id=agent_id,
+            root_cause_label=validated.root_cause_label,
+            confidence=validated.confidence,
+            weight=1.0,
+            evidence_summary=validated.evidence_summary,
+        )
+
     async def propose_remediation(
         self,
         *,
@@ -324,6 +381,120 @@ class MockLLMProvider:
         return DiagnosticPlan(
             tool_name=tool_name,
             reasoning=f"Execute read-only diagnostic tool {tool_name} per {skill.skill_id}.",
+        )
+
+    async def diagnose_specialist_hypothesis(
+        self,
+        *,
+        agent_id: str,
+        fault_type: str,
+        service_name: str,
+        evidence: dict[str, Any],
+        alert_payload: dict[str, Any],
+        skill: RunbookSkill,
+    ) -> DiagnosticHypothesis:
+        fault_mode = alert_payload.get("_mock_fault_mode", "normal")
+        if fault_mode == "consensus_conflict":
+            conflict_map = {
+                "DB_AGENT": (
+                    "db_connection_pool_exhausted",
+                    0.90,
+                    "DB_AGENT 检测到 PG16 活跃连接打满，判定为数据库连接池耗尽。",
+                ),
+                "CACHE_AGENT": (
+                    "redis_cache_stampede",
+                    0.88,
+                    "CACHE_AGENT 怀疑 Redis 热点 Key 失效引发缓存击穿，与数据库诊断存在分歧。",
+                ),
+                "LOG_AGENT": (
+                    "upstream_network_partition",
+                    0.85,
+                    "LOG_AGENT 捕获到网关批量超时日志，怀疑上游网络分区导致级联异常。",
+                ),
+            }
+            label, conf, summary = conflict_map.get(
+                agent_id, ("unknown_conflict", 0.50, f"{agent_id} 存在未决诊断分歧。")
+            )
+            return DiagnosticHypothesis(
+                agent_id=agent_id,
+                root_cause_label=label,
+                confidence=conf,
+                weight=1.0,
+                evidence_summary=summary,
+            )
+
+        if fault_mode == "consensus_low_confidence":
+            low_conf = {"DB_AGENT": 0.35, "CACHE_AGENT": 0.28, "LOG_AGENT": 0.22}.get(agent_id, 0.25)
+            return DiagnosticHypothesis(
+                agent_id=agent_id,
+                root_cause_label=fault_type,
+                confidence=low_conf,
+                weight=1.0,
+                evidence_summary=f"{agent_id} 仅观测到弱相关遥测信号，对 `{fault_type}` 的置信度不足。",
+            )
+
+        log_ev = evidence.get("log_diagnostics", {})
+        db_ev = evidence.get("db_diagnostics", {})
+
+        if fault_type == "db_connection_pool_exhausted":
+            mapping = {
+                "DB_AGENT": (
+                    0.94,
+                    f"PG16 连接数打满 ({db_ev.get('total_connections', 200)}/{db_ev.get('max_connections', 200)})，"
+                    f"存在 {db_ev.get('idle_in_transaction_count', 14)} 个长时 idle-in-transaction 会话（最长 {db_ev.get('oldest_idle_tx_seconds', 384)}s）。",
+                ),
+                "LOG_AGENT": (
+                    0.86,
+                    f"应用日志 5 分钟内出现 {log_ev.get('error_count_5m', 418)} 次 TooManyConnectionsError，"
+                    f"与 {service_name} 连接池耗尽特征高度吻合。",
+                ),
+                "CACHE_AGENT": (
+                    0.35,
+                    "Redis 7 命中率与延迟处于正常区间，排除缓存雪崩主因，间接佐证瓶颈位于下游数据库连接池。",
+                ),
+            }
+        elif fault_type == "slow_sql_lock_contention":
+            mapping = {
+                "DB_AGENT": (
+                    0.93,
+                    f"pg_locks 检测到 PID {db_ev.get('blocking_pids', [41892, 41907])} 持有 "
+                    f"{db_ev.get('blocked_relation', 'orders_ledger')} 表 {db_ev.get('lock_mode', 'ExclusiveLock')} 排他锁。",
+                ),
+                "LOG_AGENT": (
+                    0.84,
+                    f"慢查询日志显示 {log_ev.get('blocked_queries', 63)} 条请求阻塞，P99 延迟飙升至 {log_ev.get('p99_latency_ms', 14200)}ms。",
+                ),
+                "CACHE_AGENT": (
+                    0.28,
+                    "缓存层未出现异常穿透或淘汰风暴，排除 Redis 热点问题，佐证为数据库行/表锁争用。",
+                ),
+            }
+        else:
+            mapping = {
+                "CACHE_AGENT": (
+                    0.95,
+                    f"Redis 7 热点 Key `{db_ev.get('expired_hotkey', 'catalog:flash_sale:top100')}` 集中失效，"
+                    f"miss_rate 达 {db_ev.get('miss_rate', 0.91)}，回源 QPS 放大 {db_ev.get('db_qps_amplification', '18.4x')}。",
+                ),
+                "LOG_AGENT": (
+                    0.82,
+                    f"网关 1 分钟内捕获 {log_ev.get('http_504_count_1m', 219)} 次 HTTP 504，集中于热点接口 {log_ev.get('hot_endpoint', '/api/catalog/flash-sale/items')}。",
+                ),
+                "DB_AGENT": (
+                    0.42,
+                    "数据库只读 QPS 短时飙升但无排他锁或连接泄漏，符合上游缓存击穿引发的被动回源特征。",
+                ),
+            }
+
+        conf, summary = mapping.get(
+            agent_id, (0.75, f"{agent_id} 基于 Runbook {skill.skill_id} 佐证根因为 {fault_type}。")
+        )
+        return DiagnosticHypothesis(
+            agent_id=agent_id,
+            root_cause_label=fault_type,
+            confidence=conf,
+            weight=1.0,
+            evidence_summary=summary,
         )
 
     async def propose_remediation(

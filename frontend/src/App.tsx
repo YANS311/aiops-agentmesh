@@ -3,9 +3,11 @@ import {
   Activity,
   AlertTriangle,
   Archive,
+  BarChart3,
   CheckCircle2,
   Database,
   Play,
+  Scale,
   ShieldAlert,
   ShieldCheck,
   Terminal,
@@ -24,10 +26,12 @@ import {
 } from './api';
 import type {
   ActorInfo,
+  ConsensusReport,
   HealthResponse,
   IncidentDetail,
   IncidentSummary,
   RoleType,
+  ShapleyAttributionReport,
   SkillOut,
   TraceEvent,
 } from './types';
@@ -36,6 +40,7 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
   OPEN: 'bg-sky-500/20 text-sky-300 border-sky-500/40',
   TRIAGING: 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40',
   DIAGNOSING: 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40',
+  NEEDS_HUMAN_REVIEW: 'bg-orange-500/20 text-orange-300 border-orange-500/50',
   PENDING_APPROVAL: 'bg-amber-500/20 text-amber-300 border-amber-500/50',
   EXECUTING_REMEDIATION: 'bg-purple-500/20 text-purple-300 border-purple-500/40',
   RESOLVED: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50',
@@ -46,6 +51,8 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
 const REFRESH_TRIGGER_EVENTS = new Set([
   'SKILL_MATCHED',
   'TOOL_RESULT',
+  'CONSENSUS_REACHED',
+  'CONSENSUS_CONFLICT_ALERT',
   'REMEDIATION_PROPOSED',
   'APPROVAL_REQUIRED',
   'APPROVAL_GRANTED',
@@ -251,6 +258,12 @@ export default function App() {
 
   const evidence = (detail?.blackboard?.evidence ?? {}) as Record<string, unknown>;
   const matchedSkill = (detail?.blackboard?.matched_skill ?? null) as Record<string, string> | null;
+  const consensusReport = ((detail?.trajectory?.trajectory_doc?.consensus_report ??
+    detail?.blackboard?.consensus_report ??
+    null) as ConsensusReport | null);
+  const shapleyAttribution = ((detail?.trajectory?.trajectory_doc?.shapley_attribution ??
+    detail?.blackboard?.shapley_attribution ??
+    null) as ShapleyAttributionReport | null);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
@@ -542,6 +555,133 @@ export default function App() {
                       className="mt-3 rounded-lg border border-rose-500/50 bg-rose-950/40 px-3.5 py-2.5 text-xs text-rose-200"
                     >
                       {rbacBanner}
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Multi-Agent Consensus Arbiter & Exact Shapley Attribution Panel */}
+              {consensusReport && (
+                <div
+                  data-testid="consensus-shapley-panel"
+                  className="rounded-xl border border-slate-800 bg-slate-900/70 p-5 space-y-4"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <h3 className="text-sm font-semibold text-white flex items-center gap-2">
+                      <Scale className="h-4 w-4 text-cyan-400" />
+                      多智能体共识仲裁 &amp; Shapley 贡献度归因
+                    </h3>
+                    <div className="flex flex-wrap items-center gap-2 text-xs">
+                      <span
+                        data-testid="consensus-status-badge"
+                        className={`px-2.5 py-0.5 rounded-full font-semibold border ${
+                          consensusReport.status === 'CONSENSUS_REACHED'
+                            ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                            : 'bg-orange-500/20 text-orange-300 border-orange-500/50'
+                        }`}
+                      >
+                        {consensusReport.status === 'CONSENSUS_REACHED'
+                          ? '共识达成 (CONSENSUS_REACHED)'
+                          : '共识冲突拦截 (CONFLICT_FAIL_CLOSED)'}
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 font-mono">
+                        置信度 {(consensusReport.consensus_confidence * 100).toFixed(1)}%
+                      </span>
+                      <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 font-mono">
+                        一致率 {(consensusReport.agreement_ratio * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                  </div>
+
+                  <div
+                    className={`rounded-lg border px-3.5 py-2.5 text-xs ${
+                      consensusReport.status === 'CONSENSUS_REACHED'
+                        ? 'border-cyan-500/30 bg-cyan-950/20 text-cyan-100'
+                        : 'border-orange-500/40 bg-orange-950/30 text-orange-200'
+                    }`}
+                  >
+                    <strong>仲裁结论：</strong>
+                    {consensusReport.reason}
+                  </div>
+
+                  {/* Independent Specialist Hypotheses */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                    {consensusReport.hypotheses.map((hyp) => (
+                      <div
+                        key={hyp.agent_id}
+                        data-testid={`hypothesis-card-${hyp.agent_id}`}
+                        className="rounded-lg border border-slate-800 bg-slate-950/70 p-3 space-y-1.5"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-xs font-mono font-semibold text-indigo-300">
+                            {hyp.agent_id}
+                          </span>
+                          <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-slate-800 text-emerald-300">
+                            {(hyp.confidence * 100).toFixed(0)}%
+                          </span>
+                        </div>
+                        <div className="text-[11px] font-mono text-cyan-300 truncate">
+                          假设：{hyp.root_cause_label}
+                        </div>
+                        <p className="text-xs text-slate-300 leading-relaxed">
+                          {hyp.evidence_summary}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+
+                  {/* Exact Shapley Attribution Progress Bars */}
+                  {shapleyAttribution && shapleyAttribution.attributions.length > 0 && (
+                    <div
+                      data-testid="shapley-attribution-section"
+                      className="rounded-lg border border-slate-800 bg-slate-950/60 p-4 space-y-3"
+                    >
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="text-xs font-semibold text-slate-200 flex items-center gap-1.5">
+                          <BarChart3 className="h-3.5 w-3.5 text-indigo-400" />
+                          精确 Shapley 贡献度归因（2³ = {shapleyAttribution.coalition_count} 联盟）
+                        </div>
+                        <div className="text-[11px] font-mono text-slate-400">
+                          ∑φᵢ = {shapleyAttribution.efficiency_sum.toFixed(4)} | v(N)-v(∅) ={' '}
+                          {(
+                            shapleyAttribution.grand_coalition_value -
+                            shapleyAttribution.empty_coalition_value
+                          ).toFixed(4)}
+                        </div>
+                      </div>
+
+                      <div className="space-y-2.5">
+                        {shapleyAttribution.attributions.map((attr) => {
+                          const pct = Math.max(0, Math.min(100, attr.normalized_share * 100));
+                          return (
+                            <div
+                              key={attr.agent_id}
+                              data-testid={`shapley-bar-${attr.agent_id}`}
+                              className="space-y-1"
+                            >
+                              <div className="flex items-center justify-between text-xs">
+                                <span className="font-mono font-medium text-slate-200">
+                                  {attr.agent_id}
+                                  {!attr.supports_target && (
+                                    <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">
+                                      未支持最终根因
+                                    </span>
+                                  )}
+                                </span>
+                                <span className="font-mono text-slate-300">
+                                  φ = {attr.shapley_value.toFixed(4)} ({pct.toFixed(1)}%)
+                                </span>
+                              </div>
+                              <div className="h-2 w-full rounded-full bg-slate-800 overflow-hidden">
+                                <div
+                                  className="h-full rounded-full bg-gradient-to-r from-indigo-500 to-cyan-400 transition-all duration-300"
+                                  style={{ width: `${pct}%` }}
+                                />
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
                 </div>

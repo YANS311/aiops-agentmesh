@@ -4,7 +4,7 @@
 
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
-> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 25-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 28-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
 
 ## Architecture Highlights
 
@@ -22,6 +22,10 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
   - **Prometheus `/metrics`**: exposes `aiops_incidents_total`, `aiops_task_duration_seconds`, `aiops_fail_closed_blocks_total`, `aiops_outbox_pending_events`, and `aiops_dead_letter_tasks_total`.
   - **JSON Structured Logging**: unified JSON log formatter automatically carrying `incident_id`, `task_id`, `actor_id`, and `actor_role`.
   - **Graceful Shutdown**: FastAPI `lifespan` stops claiming new tasks, drains in-flight worker tasks and flushes pending `outbox_events` (bounded by `SHUTDOWN_TIMEOUT_SECONDS`) before closing Redis and PG16 connection pools.
+- **Multi-Agent Parallel Diagnosis, Weighted Consensus Arbiter & Exact Shapley Attribution (`Phase 4`)**:
+  - Dispatches 3 specialist diagnostic roles (`DB_AGENT`, `CACHE_AGENT`, `LOG_AGENT`) in parallel via `asyncio.gather`, each emitting a structured hypothesis (`root_cause_label`, `confidence`, `evidence_summary`).
+  - `ConsensusArbiter` (`backend/app/agents/consensus.py`) aggregates weighted hypotheses: reaching consensus (`consensus_confidence >= 0.60` and `disagreement_score <= 0.40`) advances to `PENDING_APPROVAL`; severe conflict or low confidence triggers **Fail-Closed** (`NEEDS_HUMAN_REVIEW` + `CONSENSUS_CONFLICT_ALERT`, strictly preventing high-risk remediation generation).
+  - `backend/app/agents/shapley.py` computes **exact Shapley values** over all $2^3 = 8$ coalitions using noisy-OR confidence gain $v(S) = 1 - \prod_{i \in S}(1 - p_i)$, satisfying Efficiency ($\sum \phi_i = v(N) - v(\emptyset)$), Symmetry, and Null-Player axioms, archived into `incident_trajectories.trajectory_doc` JSONB and rendered in the React Console.
 - **Hermes-Inspired Extensions**:
   - **Declarative Runbook Skills** (`backend/skills/*.yaml`): SOP definitions mapping fault types to `READ_ONLY` diagnostic tools and `HIGH_RISK_WRITE` remediations.
   - **Trajectory Archival** (`incident_trajectories`): Post-resolution structured JSONB archive of evidence, approval audit, execution output, `stream_consumption` metadata, and trace timeline.

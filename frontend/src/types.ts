@@ -71,6 +71,48 @@ export interface TraceEvent {
   created_at: string;
 }
 
+export interface DiagnosticHypothesis {
+  agent_id: string;
+  root_cause_label: string;
+  confidence: number;
+  weight: number;
+  evidence_summary: string;
+}
+
+export interface ConsensusReport {
+  status: 'CONSENSUS_REACHED' | 'CONFLICT_FAIL_CLOSED';
+  agreed_root_cause: string | null;
+  top_candidate_root_cause: string;
+  consensus_confidence: number;
+  agreement_ratio: number;
+  disagreement_score: number;
+  confidence_threshold: number;
+  max_disagreement: number;
+  reason: string;
+  label_scores: Record<string, number>;
+  hypotheses: DiagnosticHypothesis[];
+}
+
+export interface AgentShapleyAttribution {
+  agent_id: string;
+  root_cause_label: string;
+  confidence: number;
+  supports_target: boolean;
+  shapley_value: number;
+  normalized_share: number;
+}
+
+export interface ShapleyAttributionReport {
+  target_root_cause: string;
+  coalition_count: number;
+  empty_coalition_value: number;
+  grand_coalition_value: number;
+  efficiency_sum: number;
+  efficiency_delta: number;
+  coalition_values: Record<string, number>;
+  attributions: AgentShapleyAttribution[];
+}
+
 export interface IncidentTrajectory {
   id: string;
   incident_id: string;
