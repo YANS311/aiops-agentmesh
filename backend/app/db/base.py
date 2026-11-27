@@ -37,6 +37,14 @@ _IDEMPOTENT_MIGRATIONS: list[str] = [
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_owner VARCHAR(128)",
     "ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ",
     "ALTER TABLE remediation_approvals ADD COLUMN IF NOT EXISTS approved_by_role VARCHAR(32)",
+    "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS alert_fingerprint VARCHAR(128)",
+    "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS dedup_count INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE incidents ADD COLUMN IF NOT EXISTS last_triggered_at TIMESTAMPTZ NOT NULL DEFAULT now()",
+    (
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_incidents_active_fingerprint "
+        "ON incidents (alert_fingerprint) "
+        "WHERE alert_fingerprint IS NOT NULL AND status NOT IN ('RESOLVED', 'FAILED', 'REJECTED')"
+    ),
     "DROP INDEX IF EXISTS ix_agent_tasks_status",
     (
         "CREATE INDEX IF NOT EXISTS ix_agent_tasks_queued_partial "

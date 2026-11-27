@@ -114,6 +114,9 @@ class IncidentSummaryOut(BaseModel):
 
     id: UUID
     idempotency_key: str | None
+    alert_fingerprint: str | None = None
+    dedup_count: int = 1
+    last_triggered_at: datetime | None = None
     title: str
     severity: str
     service_name: str
@@ -126,6 +129,40 @@ class IncidentSummaryOut(BaseModel):
     created_at: datetime
     updated_at: datetime
     resolved_at: datetime | None
+
+
+class AlertmanagerAlertIn(BaseModel):
+    status: str = "firing"
+    fingerprint: str | None = Field(default=None, max_length=128)
+    labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    startsAt: str | None = None
+    endsAt: str | None = None
+    generatorURL: str | None = None
+
+
+class AlertmanagerWebhookPayload(BaseModel):
+    version: str = "4"
+    status: str = "firing"
+    receiver: str | None = None
+    groupLabels: dict[str, str] = Field(default_factory=dict)
+    commonLabels: dict[str, str] = Field(default_factory=dict)
+    commonAnnotations: dict[str, str] = Field(default_factory=dict)
+    alerts: list[AlertmanagerAlertIn] = Field(default_factory=list)
+
+
+class AlertmanagerItemResult(BaseModel):
+    fingerprint: str
+    incident_id: UUID | None = None
+    action: str
+    dedup_count: int = 0
+    incident_status: str | None = None
+
+
+class AlertmanagerWebhookResponse(BaseModel):
+    status: str = "ok"
+    processed: int
+    results: list[AlertmanagerItemResult]
 
 
 class IncidentDetailOut(IncidentSummaryOut):

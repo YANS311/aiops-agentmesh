@@ -26,6 +26,13 @@ class Incident(Base):
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
     idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True, nullable=True)
+    alert_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    dedup_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    last_triggered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
     service_name: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -59,6 +66,14 @@ class Incident(Base):
     __table_args__ = (
         Index("ix_incidents_alert_payload_gin", "alert_payload", postgresql_using="gin"),
         Index("ix_incidents_blackboard_gin", "blackboard", postgresql_using="gin"),
+        Index(
+            "uq_incidents_active_fingerprint",
+            "alert_fingerprint",
+            unique=True,
+            postgresql_where=text(
+                "alert_fingerprint IS NOT NULL AND status NOT IN ('RESOLVED', 'FAILED', 'REJECTED')"
+            ),
+        ),
     )
 
 

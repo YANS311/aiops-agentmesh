@@ -1,3 +1,4 @@
+import hashlib
 import json
 from typing import Any
 from uuid import UUID, uuid4
@@ -16,6 +17,9 @@ from app.agents.orchestrator import (
 )
 from app.api.schemas import (
     ActorOut,
+    AlertmanagerItemResult,
+    AlertmanagerWebhookPayload,
+    AlertmanagerWebhookResponse,
     ApprovalDecisionRequest,
     HealthResponse,
     IncidentDetailOut,
@@ -94,6 +98,87 @@ async def inject_incident(body: InjectIncidentRequest, request: Request) -> Inci
         idempotency_key=body.idempotency_key,
     )
     return IncidentSummaryOut.model_validate(incident)
+
+
+def _infer_fault_type(labels: dict[str, str]) -> str:
+    explicit = labels.get("fault_type", "").strip()
+    if explicit:
+        return explicit
+    alertname = labels.get("alertname", "").lower()
+    if "redis" in alertname or "cache" in alertname or "stampede" in alertname:
+        return "redis_cache_stampede"
+    if "lock" in alertname or "slow" in alertname:
+        return "slow_sql_lock_contention"
+    return "db_connection_pool_exhausted"
+
+
+def _normalize_severity(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    upper = raw.strip().upper()
+    if upper in {"P0", "P1", "P2", "P3"}:
+        return upper
+    mapping = {"CRITICAL": "P0", "HIGH": "P0", "WARNING": "P1", "MEDIUM": "P2", "INFO": "P3"}
+    return mapping.get(upper, "P1")
+
+
+@router.post("/webhooks/alertmanager", response_model=AlertmanagerWebhookResponse)
+async def alertmanager_webhook(
+    body: AlertmanagerWebhookPayload, request: Request
+) -> AlertmanagerWebhookResponse:
+    orch = _get_orchestrator(request)
+    results: list[AlertmanagerItemResult] = []
+    for alert in body.alerts:
+        merged_labels = {**body.commonLabels, **alert.labels}
+        merged_annotations = {**body.commonAnnotations, **alert.annotations}
+        fingerprint = (alert.fingerprint or "").strip()
+        if not fingerprint:
+            canonical = json.dumps(merged_labels, sort_keys=True, ensure_ascii=False)
+            fingerprint = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+        if alert.status.strip().lower() == "resolved":
+            results.append(
+                AlertmanagerItemResult(
+                    fingerprint=fingerprint,
+                    incident_id=None,
+                    action="ignored_resolved",
+                    dedup_count=0,
+                    incident_status=None,
+                )
+            )
+            continue
+
+        fault_type = _infer_fault_type(merged_labels)
+        severity = _normalize_severity(merged_labels.get("severity"))
+        service_name = merged_labels.get("service") or merged_labels.get("instance")
+        title = merged_annotations.get("summary") or merged_labels.get("alertname")
+
+        incident, action = await orch.ingest_alertmanager_alert(
+            fingerprint=fingerprint,
+            fault_type=fault_type,
+            title=title,
+            severity=severity,
+            service_name=service_name,
+            alert_payload={
+                "source": "alertmanager",
+                "receiver": body.receiver,
+                "labels": merged_labels,
+                "annotations": merged_annotations,
+                "startsAt": alert.startsAt,
+                "generatorURL": alert.generatorURL,
+            },
+        )
+        results.append(
+            AlertmanagerItemResult(
+                fingerprint=fingerprint,
+                incident_id=incident.id,
+                action=action,
+                dedup_count=incident.dedup_count,
+                incident_status=incident.status,
+            )
+        )
+
+    return AlertmanagerWebhookResponse(status="ok", processed=len(results), results=results)
 
 
 @router.get("/incidents", response_model=list[IncidentSummaryOut])

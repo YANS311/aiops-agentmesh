@@ -1,5 +1,19 @@
 name: aiops-agentmesh-prod
 
+x-backend-env: &backend-env
+  DATABASE_URL: postgresql+asyncpg://aiops:aiops_prod_pwd@postgres:5432/aiops_mesh
+  REDIS_URL: redis://redis:6379/0
+  LLM_PROVIDER: ${LLM_PROVIDER:-mock}
+  LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
+  LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
+  LLM_API_KEY: ${LLM_API_KEY:-}
+  AUTO_INIT_DB: "false"
+  EMBEDDED_WORKERS: "false"
+  TOOL_EXECUTION_MODE: ${TOOL_EXECUTION_MODE:-live}
+  RBAC_VIEWER_TOKEN: ${RBAC_VIEWER_TOKEN:-viewer-demo-token}
+  RBAC_APPROVER_TOKEN: ${RBAC_APPROVER_TOKEN:-sre-approver-demo-token}
+  SHUTDOWN_TIMEOUT_SECONDS: "10"
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -23,30 +37,57 @@ services:
       timeout: 3s
       retries: 10
 
-  backend:
+  backend-api:
     build:
       context: ./backend
       dockerfile: Dockerfile
     environment:
-      DATABASE_URL: postgresql+asyncpg://aiops:aiops_prod_pwd@postgres:5432/aiops_mesh
-      REDIS_URL: redis://redis:6379/0
-      LLM_PROVIDER: ${LLM_PROVIDER:-mock}
-      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com/v1}
-      LLM_MODEL: ${LLM_MODEL:-deepseek-chat}
-      LLM_API_KEY: ${LLM_API_KEY:-}
-      AUTO_INIT_DB: "false"
-      RBAC_VIEWER_TOKEN: ${RBAC_VIEWER_TOKEN:-viewer-demo-token}
-      RBAC_APPROVER_TOKEN: ${RBAC_APPROVER_TOKEN:-sre-approver-demo-token}
+      <<: *backend-env
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+    stop_grace_period: 15s
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8016/api/v1/health')\""]
       interval: 5s
       timeout: 3s
       retries: 12
+
+  backend-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.entrypoints.worker"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      backend-api:
+        condition: service_healthy
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.entrypoints.worker", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend-relay:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "app.entrypoints.relay"]
+    environment:
+      <<: *backend-env
+    depends_on:
+      backend-api:
+        condition: service_healthy
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "python", "-m", "app.entrypoints.relay", "--healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   frontend-nginx:
     build:
@@ -55,7 +96,7 @@ services:
     ports:
       - "127.0.0.1:8088:80"
     depends_on:
-      backend:
+      backend-api:
         condition: service_healthy
 
 volumes:

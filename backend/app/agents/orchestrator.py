@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
 from redis.exceptions import RedisError
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -204,6 +204,135 @@ class AIOpsOrchestrator:
         await self._publish_pending(incident_id, pending_events, blackboard_copy)
         self.notify_worker()
         return incident
+
+    async def ingest_alertmanager_alert(
+        self,
+        *,
+        fingerprint: str,
+        fault_type: str,
+        title: str | None = None,
+        severity: str | None = None,
+        service_name: str | None = None,
+        alert_payload: dict[str, Any] | None = None,
+    ) -> tuple[Incident, str]:
+        """Ingest one Alertmanager alert with concurrency-safe active-fingerprint deduplication.
+
+        Uses PG transaction-scoped advisory lock (`pg_advisory_xact_lock(hashtext(fingerprint))`)
+        backed by partial unique index `uq_incidents_active_fingerprint` so concurrent duplicate
+        webhooks atomically increment `dedup_count` without creating duplicate incidents.
+        """
+        skill = self.skill_registry.match_for_fault(fault_type)
+        resolved_severity = severity or (skill.default_severity if skill else "P1")
+        resolved_service = service_name or (skill.default_service if skill else "unknown-service")
+        resolved_title = title or (
+            f"[{resolved_severity}] {skill.title} on {resolved_service}"
+            if skill
+            else f"[{resolved_severity}] {fault_type} on {resolved_service}"
+        )
+        payload = dict(alert_payload or {})
+        payload.setdefault("fault_type", fault_type)
+        payload.setdefault("service_name", resolved_service)
+        payload["fingerprint"] = fingerprint
+
+        pending_events: list[TraceEvent] = []
+        action = "created"
+        now = datetime.now(timezone.utc)
+
+        async with self.session_factory() as session:
+            async with session.begin():
+                # Serialize concurrent webhooks sharing the exact same fingerprint.
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:fp))"),
+                    {"fp": fingerprint},
+                )
+                existing = (
+                    await session.execute(
+                        select(Incident)
+                        .where(
+                            Incident.alert_fingerprint == fingerprint,
+                            Incident.status.notin_(("RESOLVED", "FAILED", "REJECTED")),
+                        )
+                        .with_for_update()
+                    )
+                ).scalar_one_or_none()
+
+                if existing is not None:
+                    existing.dedup_count += 1
+                    existing.last_triggered_at = now
+                    existing.version += 1
+                    pending_events.append(
+                        await append_trace_event(
+                            session,
+                            incident_id=existing.id,
+                            agent_role="SYSTEM",
+                            event_type="ALERT_DEDUPLICATED",
+                            risk_tier="NONE",
+                            summary=(
+                                f"Alert storm suppressed for fingerprint `{fingerprint}` "
+                                f"(dedup_count={existing.dedup_count})."
+                            ),
+                            payload={
+                                "fingerprint": fingerprint,
+                                "dedup_count": existing.dedup_count,
+                                "last_triggered_at": now.isoformat(),
+                            },
+                        )
+                    )
+                    incident = existing
+                    incident_id = existing.id
+                    blackboard_copy = dict(existing.blackboard or {})
+                    action = "deduplicated"
+                else:
+                    incident = Incident(
+                        alert_fingerprint=fingerprint,
+                        dedup_count=1,
+                        last_triggered_at=now,
+                        title=resolved_title,
+                        severity=resolved_severity,
+                        service_name=resolved_service,
+                        fault_type=fault_type,
+                        status="OPEN",
+                        alert_payload=payload,
+                        blackboard={"stage": "OPEN", "evidence": {}},
+                    )
+                    session.add(incident)
+                    await session.flush()
+
+                    pending_events.append(
+                        await append_trace_event(
+                            session,
+                            incident_id=incident.id,
+                            agent_role="SYSTEM",
+                            event_type="ALERT_INJECTED",
+                            risk_tier="NONE",
+                            summary=f"Alertmanager webhook ingested: {resolved_title}",
+                            payload={
+                                "fault_type": fault_type,
+                                "service_name": resolved_service,
+                                "fingerprint": fingerprint,
+                                "source": "alertmanager",
+                            },
+                        )
+                    )
+
+                    session.add(
+                        AgentTask(
+                            incident_id=incident.id,
+                            agent_role="COORDINATOR",
+                            step_order=10,
+                            action_type="ORCHESTRATE",
+                            status="QUEUED",
+                            input_payload={"fault_type": fault_type, "fingerprint": fingerprint},
+                        )
+                    )
+                    await session.flush()
+                    incident_id = incident.id
+                    blackboard_copy = dict(incident.blackboard)
+
+        await self._publish_pending(incident_id, pending_events, blackboard_copy)
+        if action == "created":
+            self.notify_worker()
+        return incident, action
 
     async def process_one_task(self, worker_id: str = "worker-1") -> bool:
         """Claim one QUEUED task (FOR UPDATE SKIP LOCKED + lease) and execute it."""
@@ -475,11 +604,16 @@ class AIOpsOrchestrator:
             skill=skill,
         )
 
-        spec, tool_output = self.policy_guard.execute_authorized(
+        spec, tool_output = await self.policy_guard.execute_authorized_async(
             agent_role=task.agent_role,
             tool_name=plan.tool_name,
             incident=incident,
-            context={"service_name": incident.service_name, "alert_payload": incident.alert_payload},
+            context={
+                "service_name": incident.service_name,
+                "alert_payload": incident.alert_payload,
+                "db_session": session,
+                "redis_client": self.redis_bus.redis,
+            },
             approval=None,
         )
 

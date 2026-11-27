@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     rbac_viewer_token: str = "viewer-demo-token"
     rbac_approver_token: str = "sre-approver-demo-token"
     auto_init_db: bool = False
+    embedded_workers: bool = False
+    tool_execution_mode: str = "mock"
     skills_dir: Path = Path(__file__).resolve().parents[1] / "skills"
 
 

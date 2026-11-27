@@ -4,7 +4,7 @@
 
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
-> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 28-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 31-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
 
 ## Architecture Highlights
 
@@ -22,6 +22,10 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
   - **Prometheus `/metrics`**: exposes `aiops_incidents_total`, `aiops_task_duration_seconds`, `aiops_fail_closed_blocks_total`, `aiops_outbox_pending_events`, and `aiops_dead_letter_tasks_total`.
   - **JSON Structured Logging**: unified JSON log formatter automatically carrying `incident_id`, `task_id`, `actor_id`, and `actor_role`.
   - **Graceful Shutdown**: FastAPI `lifespan` stops claiming new tasks, drains in-flight worker tasks and flushes pending `outbox_events` (bounded by `SHUTDOWN_TIMEOUT_SECONDS`) before closing Redis and PG16 connection pools.
+- **Decoupled 6-Container Production Architecture, Live Probes & Alertmanager Storm Dedup (`Phase 5`)**:
+  - **Process Decoupling (`EMBEDDED_WORKERS=false`)**: FastAPI `backend-api` serves only HTTP/SSE traffic; `backend-worker` (`python -m app.entrypoints.worker`) runs `AgentWorker` + `LeaseWatchdog` (horizontally scalable via `--scale backend-worker=N`); `backend-relay` (`python -m app.entrypoints.relay`) runs `OutboxRelay` + `TrajectoryStreamConsumer`, each with independent healthchecks and `SIGTERM` graceful drain.
+  - **Live Read-Only Probes (`TOOL_EXECUTION_MODE=live|mock`)**: In `live` mode, diagnostic tools execute real queries against PostgreSQL 16 (`pg_stat_activity`, `pg_locks`) and Redis 7 (`INFO memory`, `INFO stats`, `SLOWLOG GET`), while all `HIGH_RISK_WRITE` tools remain strictly Fail-Closed.
+  - **Prometheus Alertmanager Webhook (`POST /api/v1/webhooks/alertmanager`)**: Ingests standard Alertmanager v4 payloads with concurrency-safe active-fingerprint deduplication (`pg_advisory_xact_lock` + partial unique index `uq_incidents_active_fingerprint` via Alembic `0002_alert_dedup_fields`), atomically incrementing `dedup_count` and refreshing `last_triggered_at` during alert storms.
 - **Multi-Agent Parallel Diagnosis, Weighted Consensus Arbiter & Exact Shapley Attribution (`Phase 4`)**:
   - Dispatches 3 specialist diagnostic roles (`DB_AGENT`, `CACHE_AGENT`, `LOG_AGENT`) in parallel via `asyncio.gather`, each emitting a structured hypothesis (`root_cause_label`, `confidence`, `evidence_summary`).
   - `ConsensusArbiter` (`backend/app/agents/consensus.py`) aggregates weighted hypotheses: reaching consensus (`consensus_confidence >= 0.60` and `disagreement_score <= 0.40`) advances to `PENDING_APPROVAL`; severe conflict or low confidence triggers **Fail-Closed** (`NEEDS_HUMAN_REVIEW` + `CONSENSUS_CONFLICT_ALERT`, strictly preventing high-risk remediation generation).
@@ -64,14 +68,22 @@ cd backend
 
 ## Production Deployment (`docker-compose.prod.yml`)
 
-One-command full-stack production deployment (**PostgreSQL 16 + Redis 7 + FastAPI + Nginx-hosted React SPA**):
+One-command **6-container decoupled production deployment** (**`postgres` + `redis` + `backend-api` + `backend-worker` + `backend-relay` + `frontend-nginx`**):
 
 ```bash
-# Build & launch production stack (auto-runs `alembic upgrade head` before uvicorn)
-LLM_PROVIDER=mock docker compose -f docker-compose.prod.yml up -d --build --wait
+# Build & launch 6-container production stack (backend-api auto-runs `alembic upgrade head`)
+LLM_PROVIDER=mock TOOL_EXECUTION_MODE=live docker compose -f docker-compose.prod.yml up -d --build --wait
+
+# Scale concurrent SKIP LOCKED workers horizontally (optional)
+docker compose -f docker-compose.prod.yml up -d --scale backend-worker=2
 
 # Console entrypoint (Nginx -> React SPA + /api reverse proxy + unbuffered SSE)
 # http://127.0.0.1:8088/
+
+# Trigger standard Prometheus Alertmanager webhook
+curl -X POST http://127.0.0.1:8088/api/v1/webhooks/alertmanager \
+  -H "Content-Type: application/json" \
+  -d '{"version":"4","status":"firing","alerts":[{"status":"firing","fingerprint":"fp-demo-001","labels":{"alertname":"PG16PoolExhausted","severity":"critical","service":"payment-core","fault_type":"db_connection_pool_exhausted"},"annotations":{"summary":"PG16 pool saturated"}}]}'
 
 # Prometheus metrics endpoint
 curl http://127.0.0.1:8088/metrics

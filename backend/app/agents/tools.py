@@ -1,6 +1,10 @@
+from collections.abc import Awaitable
 from dataclasses import dataclass
 from enum import StrEnum
+import inspect
 from typing import Any, Callable
+
+from sqlalchemy import text
 
 from app.db.models import Incident, RemediationApproval
 
@@ -24,6 +28,7 @@ class ToolSpec:
     permission: ToolPermission
     description: str
     handler: Callable[[dict[str, Any]], dict[str, Any]]
+    live_handler: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None
 
 
 def _query_service_error_logs(ctx: dict[str, Any]) -> dict[str, Any]:
@@ -87,6 +92,189 @@ def _inspect_redis_hotkeys(ctx: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Live Read-Only Probes (TOOL_EXECUTION_MODE=live): real PG16 + Redis 7 stats
+# ---------------------------------------------------------------------------
+
+
+async def _live_inspect_pg_stat_activity(ctx: dict[str, Any]) -> dict[str, Any]:
+    session = ctx.get("db_session")
+    if session is None:
+        return {**_inspect_pg_stat_activity(ctx), "mode": "mock_fallback"}
+
+    max_conn_raw = (await session.execute(text("SHOW max_connections"))).scalar_one()
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    count(*)::int AS total_connections,
+                    count(*) FILTER (WHERE state = 'active')::int AS active_connections,
+                    count(*) FILTER (WHERE state = 'idle in transaction')::int AS idle_in_tx,
+                    COALESCE(
+                        EXTRACT(
+                            EPOCH FROM max(now() - state_change)
+                            FILTER (WHERE state = 'idle in transaction')
+                        ),
+                        0
+                    )::float AS oldest_idle_tx_seconds
+                FROM pg_stat_activity
+                """
+            )
+        )
+    ).one()
+    pids = (
+        await session.execute(
+            text(
+                """
+                SELECT pid
+                FROM pg_stat_activity
+                WHERE state = 'idle in transaction'
+                ORDER BY state_change ASC
+                LIMIT 5
+                """
+            )
+        )
+    ).scalars().all()
+    return {
+        "mode": "live",
+        "source": "pg16-live:pg_stat_activity",
+        "total_connections": int(row.total_connections),
+        "active_connections": int(row.active_connections),
+        "max_connections": int(str(max_conn_raw)),
+        "idle_in_transaction_count": int(row.idle_in_tx),
+        "oldest_idle_tx_seconds": round(float(row.oldest_idle_tx_seconds), 2),
+        "suspect_pids": [int(p) for p in pids],
+    }
+
+
+async def _live_inspect_pg_locks(ctx: dict[str, Any]) -> dict[str, Any]:
+    session = ctx.get("db_session")
+    if session is None:
+        return {**_inspect_pg_locks(ctx), "mode": "mock_fallback"}
+
+    row = (
+        await session.execute(
+            text(
+                """
+                SELECT
+                    count(*)::int AS total_locks,
+                    count(*) FILTER (WHERE NOT granted)::int AS waiting_locks
+                FROM pg_locks
+                """
+            )
+        )
+    ).one()
+    blocking_rows = (
+        await session.execute(
+            text(
+                """
+                SELECT DISTINCT unnest(pg_blocking_pids(pid)) AS blocker_pid
+                FROM pg_stat_activity
+                WHERE wait_event_type = 'Lock'
+                LIMIT 10
+                """
+            )
+        )
+    ).scalars().all()
+    modes = (
+        await session.execute(
+            text(
+                """
+                SELECT mode, count(*)::int AS cnt
+                FROM pg_locks
+                GROUP BY mode
+                ORDER BY cnt DESC
+                LIMIT 5
+                """
+            )
+        )
+    ).all()
+    return {
+        "mode": "live",
+        "source": "pg16-live:pg_locks",
+        "total_locks": int(row.total_locks),
+        "waiting_locks": int(row.waiting_locks),
+        "blocking_pids": [int(p) for p in blocking_rows],
+        "wait_event_type": "Lock" if int(row.waiting_locks) > 0 else "None",
+        "lock_mode": modes[0][0] if modes else "AccessShareLock",
+        "lock_modes": {str(m): int(c) for m, c in modes},
+        "blocked_relation": "pg_locks",
+    }
+
+
+async def _live_inspect_redis_hotkeys(ctx: dict[str, Any]) -> dict[str, Any]:
+    redis_client = ctx.get("redis_client")
+    if redis_client is None:
+        return {**_inspect_redis_hotkeys(ctx), "mode": "mock_fallback"}
+
+    mem_info = await redis_client.info("memory")
+    stats_info = await redis_client.info("stats")
+    slowlog = await redis_client.slowlog_get(5)
+
+    hits = int(stats_info.get("keyspace_hits", 0))
+    misses = int(stats_info.get("keyspace_misses", 0))
+    total_ops = hits + misses
+    miss_rate = round(misses / total_ops, 4) if total_ops > 0 else 0.0
+
+    return {
+        "mode": "live",
+        "source": "redis7-live:info_and_slowlog",
+        "used_memory_bytes": int(mem_info.get("used_memory", 0)),
+        "used_memory_human": str(mem_info.get("used_memory_human", "0B")),
+        "keyspace_hits": hits,
+        "keyspace_misses": misses,
+        "miss_rate": miss_rate,
+        "instantaneous_ops_per_sec": int(stats_info.get("instantaneous_ops_per_sec", 0)),
+        "evicted_keys": int(stats_info.get("evicted_keys", 0)),
+        "slowlog_count": len(slowlog),
+        "slowlog_sample": [
+            {
+                "id": int(item.get("id", 0)),
+                "duration_us": int(item.get("duration", 0)),
+                "command": str(item.get("command", ""))[:120],
+            }
+            for item in slowlog
+        ],
+    }
+
+
+async def _live_query_service_error_logs(ctx: dict[str, Any]) -> dict[str, Any]:
+    base = _query_service_error_logs(ctx)
+    pg_live = await _live_inspect_pg_stat_activity(ctx)
+    return {
+        **base,
+        "mode": "live",
+        "source": "pg16-live:error_correlation",
+        "live_pg_connections": pg_live.get("total_connections"),
+        "live_pg_max_connections": pg_live.get("max_connections"),
+    }
+
+
+async def _live_query_slow_sql_logs(ctx: dict[str, Any]) -> dict[str, Any]:
+    base = _query_slow_sql_logs(ctx)
+    locks_live = await _live_inspect_pg_locks(ctx)
+    return {
+        **base,
+        "mode": "live",
+        "source": "pg16-live:slow_sql_correlation",
+        "live_waiting_locks": locks_live.get("waiting_locks"),
+        "live_total_locks": locks_live.get("total_locks"),
+    }
+
+
+async def _live_query_gateway_latency_logs(ctx: dict[str, Any]) -> dict[str, Any]:
+    base = _query_gateway_latency_logs(ctx)
+    redis_live = await _live_inspect_redis_hotkeys(ctx)
+    return {
+        **base,
+        "mode": "live",
+        "source": "redis7-live:gateway_correlation",
+        "live_redis_ops_per_sec": redis_live.get("instantaneous_ops_per_sec"),
+        "live_redis_used_memory": redis_live.get("used_memory_human"),
+    }
+
+
 def _terminate_idle_in_tx_and_recycle_pool(ctx: dict[str, Any]) -> dict[str, Any]:
     service = ctx.get("service_name", "payment-core")
     return {
@@ -121,7 +309,11 @@ def _enable_singleflight_and_prewarm_hotkey(ctx: dict[str, Any]) -> dict[str, An
 class ToolRegistry:
     """Registry of read-only diagnostic and high-risk write remediation tools."""
 
-    def __init__(self) -> None:
+    def __init__(self, execution_mode: str = "mock") -> None:
+        mode = execution_mode.strip().lower()
+        if mode not in {"mock", "live"}:
+            raise ValueError(f"Unsupported TOOL_EXECUTION_MODE={execution_mode!r}; expected 'mock' or 'live'.")
+        self.execution_mode = mode
         self._tools: dict[str, ToolSpec] = {}
         for spec in [
             ToolSpec(
@@ -129,36 +321,42 @@ class ToolRegistry:
                 permission=ToolPermission.READ_ONLY,
                 description="Query application error logs for pool exhaustion or timeouts.",
                 handler=_query_service_error_logs,
+                live_handler=_live_query_service_error_logs,
             ),
             ToolSpec(
                 name="inspect_pg_stat_activity",
                 permission=ToolPermission.READ_ONLY,
                 description="Inspect PostgreSQL 16 pg_stat_activity connection states.",
                 handler=_inspect_pg_stat_activity,
+                live_handler=_live_inspect_pg_stat_activity,
             ),
             ToolSpec(
                 name="query_slow_sql_logs",
                 permission=ToolPermission.READ_ONLY,
                 description="Query slow SQL digests and blocked query counts.",
                 handler=_query_slow_sql_logs,
+                live_handler=_live_query_slow_sql_logs,
             ),
             ToolSpec(
                 name="inspect_pg_locks",
                 permission=ToolPermission.READ_ONLY,
                 description="Inspect PostgreSQL 16 lock tree and blocking PIDs.",
                 handler=_inspect_pg_locks,
+                live_handler=_live_inspect_pg_locks,
             ),
             ToolSpec(
                 name="query_gateway_latency_logs",
                 permission=ToolPermission.READ_ONLY,
                 description="Query API gateway latency spikes and upstream 504s.",
                 handler=_query_gateway_latency_logs,
+                live_handler=_live_query_gateway_latency_logs,
             ),
             ToolSpec(
                 name="inspect_redis_hotkeys",
                 permission=ToolPermission.READ_ONLY,
                 description="Inspect Redis 7 hot-key miss ratio and QPS amplification.",
                 handler=_inspect_redis_hotkeys,
+                live_handler=_live_inspect_redis_hotkeys,
             ),
             ToolSpec(
                 name="terminate_idle_in_tx_and_recycle_pool",
@@ -245,4 +443,31 @@ class PolicyGuard:
             incident=incident,
             approval=approval,
         )
+        return spec, spec.handler(context)
+
+    async def execute_authorized_async(
+        self,
+        *,
+        agent_role: str,
+        tool_name: str,
+        incident: Incident,
+        context: dict[str, Any],
+        approval: RemediationApproval | None = None,
+    ) -> tuple[ToolSpec, dict[str, Any]]:
+        """Authorize via Fail-Closed policy, then invoke live async probe (if live mode) or mock handler."""
+        spec = self.authorize_tool_call(
+            agent_role=agent_role,
+            tool_name=tool_name,
+            incident=incident,
+            approval=approval,
+        )
+        if (
+            self.registry.execution_mode == "live"
+            and spec.permission == ToolPermission.READ_ONLY
+            and spec.live_handler is not None
+        ):
+            res = spec.live_handler(context)
+            if inspect.isawaitable(res):
+                return spec, await res
+            return spec, res
         return spec, spec.handler(context)
