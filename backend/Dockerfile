@@ -1,9 +1,11 @@
 FROM python:3.12-slim
 
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+    PIP_INDEX_URL=${PIP_INDEX_URL}
 
 WORKDIR /app
 

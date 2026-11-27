@@ -1,10 +1,13 @@
 # AgentMesh AIOps Control Plane
 
 [![CI](https://github.com/YANS311/aiops-agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/YANS311/aiops-agentmesh/actions/workflows/ci.yml)
+[![CD](https://github.com/YANS311/aiops-agentmesh/actions/workflows/cd.yml/badge.svg)](https://github.com/YANS311/aiops-agentmesh/actions/workflows/cd.yml)
 
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
-> **Automated CI Pipeline** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 31-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> **Automated CI/CD Pipeline**:
+> - **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 31-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> - **CD** ([.github/workflows/cd.yml](.github/workflows/cd.yml)): Triggered on `v*` release tags to build and push multi-service container images (`backend` & `frontend`) to **GitHub Container Registry (GHCR)** and publish the **GitHub Release** with `docker-compose.prod.yml`.
 
 ## Architecture Highlights
 
