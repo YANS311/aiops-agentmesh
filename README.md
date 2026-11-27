@@ -1,6 +1,6 @@
 # AgentMesh AIOps Control Plane
 
-[![CI](https://img.shields.io/badge/CI-GitHub%20Actions%20(PG16%20%2B%20Redis%207%20%2B%20Node%2020)-2088FF?logo=githubactions&logoColor=white)](.github/workflows/ci.yml)
+[![CI](https://github.com/YANS311/aiops-agentmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/YANS311/aiops-agentmesh/actions/workflows/ci.yml)
 
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
