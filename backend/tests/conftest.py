@@ -32,7 +32,7 @@ async def pg_engine_and_factory() -> AsyncIterator[
     async with engine.begin() as conn:
         await conn.execute(
             text(
-                "TRUNCATE TABLE outbox_events, incident_trajectories, trace_events, "
+                "TRUNCATE TABLE a2a_peers, outbox_events, incident_trajectories, trace_events, "
                 "remediation_approvals, agent_tasks, incidents RESTART IDENTITY CASCADE"
             )
         )

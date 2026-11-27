@@ -18,3 +18,6 @@ frontend/.vite/
 .env
 .env.local
 *.log
+
+# Local-only notes & weekly reports (never commit)
+.local/

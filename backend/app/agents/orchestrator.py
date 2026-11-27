@@ -15,11 +15,13 @@ from app.a2a.client import A2AClient
 from app.agents.consensus import run_parallel_diagnosis_and_attribution
 from app.agents.llm import LLMProvider, MalformedLLMOutputError
 from app.agents.reliability import OutboxRelay
+from app.agents.semantics import ExecutionOutcome
 from app.agents.tools import (
     ApprovalRequiredError,
     PolicyGuard,
     PolicyViolationError,
     ToolRegistry,
+    run_remediation_post_check,
 )
 from app.db.models import (
     A2APeer,
@@ -38,7 +40,11 @@ from app.db.repositories import (
     serialize_trace_event,
 )
 from app.observability.logging import bind_log_context
-from app.observability.metrics import FAIL_CLOSED_BLOCKS_TOTAL, TASK_DURATION_SECONDS
+from app.observability.metrics import (
+    FAIL_CLOSED_BLOCKS_TOTAL,
+    REMEDIATION_OUTCOMES_TOTAL,
+    TASK_DURATION_SECONDS,
+)
 from app.redis_bus.events import RedisEventBus
 from app.skills.loader import SkillRegistry
 
@@ -1011,40 +1017,164 @@ class AIOpsOrchestrator:
         tool_name = (task.input_payload or {}).get("tool_name") or (
             (approval.action_plan or {}).get("tool_name") if approval else ""
         )
+        exec_ctx = {
+            "service_name": incident.service_name,
+            "alert_payload": incident.alert_payload,
+            "db_session": session,
+            "redis_client": self.redis_bus.redis,
+        }
         spec, exec_result = self.policy_guard.execute_authorized(
             agent_role="EXECUTOR",
             tool_name=tool_name,
             incident=incident,
-            context={"service_name": incident.service_name, "alert_payload": incident.alert_payload},
+            context=exec_ctx,
             approval=approval,
         )
 
         now = datetime.now(timezone.utc)
         assert approval is not None
-        approval.status = "EXECUTED"
+
+        if exec_result.get("simulated", True):
+            exec_result["execution_outcome"] = ExecutionOutcome.SIMULATED.value
+            REMEDIATION_OUTCOMES_TOTAL.labels(outcome=ExecutionOutcome.SIMULATED.value).inc()
+
+            approval.status = "EXECUTED"
+            approval.executed_at = now
+            approval.execution_result = exec_result
+
+            task.status = "COMPLETED"
+            task.output_payload = exec_result
+            task.completed_at = now
+
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="EXECUTOR",
+                    event_type="REMEDIATION_SIMULATED",
+                    risk_tier=spec.permission.value,
+                    summary=f"Simulated remediation `{spec.name}` (no real production mutation).",
+                    payload=exec_result,
+                )
+            )
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="EXECUTOR",
+                    event_type="HIGH_RISK_EXECUTED",
+                    risk_tier=spec.permission.value,
+                    summary=f"Executed approved remediation `{spec.name}` [outcome=SIMULATED]",
+                    payload=exec_result,
+                )
+            )
+            bb = dict(incident.blackboard or {})
+            bb["stage"] = "AWAITING_TRAJECTORY_ARCHIVE"
+            bb["execution_outcome"] = ExecutionOutcome.SIMULATED.value
+            bb["execution_result"] = exec_result
+            incident.blackboard = bb
+            flag_modified(incident, "blackboard")
+            incident.version += 1
+            return
+
+        # Real execution path: run independent read-only Post-Check (never trust write tool return value).
+        post_check = await run_remediation_post_check(incident, exec_result, exec_ctx)
+        outcome = str(post_check.get("outcome", ExecutionOutcome.UNKNOWN.value))
+        exec_result["execution_outcome"] = outcome
+        exec_result["post_check"] = post_check
+        REMEDIATION_OUTCOMES_TOTAL.labels(outcome=outcome).inc()
+
         approval.executed_at = now
         approval.execution_result = exec_result
-
-        task.status = "COMPLETED"
-        task.output_payload = exec_result
-        task.completed_at = now
-
-        pending_events.append(
-            await append_trace_event(
-                session,
-                incident_id=incident.id,
-                agent_role="EXECUTOR",
-                event_type="HIGH_RISK_EXECUTED",
-                risk_tier=spec.permission.value,
-                summary=f"Executed approved high-risk remediation `{spec.name}`",
-                payload=exec_result,
-            )
-        )
-
-        # Trajectory archival & RESOLVED transition are consumed downstream via Redis Streams (Consumer Group + XACK).
         bb = dict(incident.blackboard or {})
-        bb["stage"] = "AWAITING_TRAJECTORY_ARCHIVE"
+        bb["execution_outcome"] = outcome
         bb["execution_result"] = exec_result
+        bb["post_check"] = post_check
+
+        if outcome == ExecutionOutcome.VERIFIED.value:
+            approval.status = "EXECUTED"
+            task.status = "COMPLETED"
+            task.output_payload = exec_result
+            task.completed_at = now
+
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="POST_CHECK",
+                    event_type="POST_CHECK_VERIFIED",
+                    risk_tier="READ_ONLY",
+                    summary=str(post_check.get("summary", "Independent post-check verified recovery.")),
+                    payload=post_check,
+                )
+            )
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="EXECUTOR",
+                    event_type="HIGH_RISK_EXECUTED",
+                    risk_tier=spec.permission.value,
+                    summary=f"Executed & verified remediation `{spec.name}` [outcome=VERIFIED]",
+                    payload=exec_result,
+                )
+            )
+            bb["stage"] = "AWAITING_TRAJECTORY_ARCHIVE"
+        elif outcome == ExecutionOutcome.UNKNOWN.value:
+            # Never auto-retry high-risk writes when post-check is inconclusive; require human reconciliation.
+            approval.status = "EXECUTED"
+            task.status = "FAILED"
+            task.max_attempts = task.attempt_count
+            task.error_message = str(post_check.get("summary", "Post-check inconclusive"))
+            task.output_payload = exec_result
+            task.completed_at = now
+
+            incident.status = "NEEDS_HUMAN_REVIEW"
+            bb["stage"] = "NEEDS_HUMAN_REVIEW"
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="POST_CHECK",
+                    event_type="POST_CHECK_UNKNOWN_RECONCILE_REQUIRED",
+                    risk_tier="HIGH_RISK_WRITE",
+                    summary=str(post_check.get("summary", "Post-check timed out; human reconciliation required.")),
+                    payload=post_check,
+                )
+            )
+        else:
+            approval.status = "EXECUTED"
+            task.status = "FAILED"
+            task.max_attempts = task.attempt_count
+            task.error_message = str(post_check.get("summary", "Post-check failed"))
+            task.output_payload = exec_result
+            task.completed_at = now
+
+            incident.status = "FAILED"
+            bb["stage"] = "FAILED"
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="POST_CHECK",
+                    event_type="POST_CHECK_FAILED",
+                    risk_tier="HIGH_RISK_WRITE",
+                    summary=str(post_check.get("summary", "Independent post-check failed.")),
+                    payload=post_check,
+                )
+            )
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role="SYSTEM",
+                    event_type="INCIDENT_FAILED",
+                    risk_tier="HIGH_RISK_WRITE",
+                    summary=f"Incident marked FAILED after independent Post-Check failed for `{spec.name}`.",
+                    payload={"execution_outcome": outcome},
+                )
+            )
+
         incident.blackboard = bb
         flag_modified(incident, "blackboard")
         incident.version += 1

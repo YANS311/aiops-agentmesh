@@ -35,6 +35,14 @@ FAIL_CLOSED_BLOCKS_TOTAL = Counter(
     ["reason"],
 )
 
+REMEDIATION_OUTCOMES_TOTAL = Counter(
+    "aiops_remediation_outcomes_total",
+    "Total number of remediation executions grouped by execution_outcome (SIMULATED|VERIFIED|UNKNOWN|FAILED)",
+    ["outcome"],
+)
+for _outcome in ("SIMULATED", "VERIFIED", "UNKNOWN", "FAILED"):
+    REMEDIATION_OUTCOMES_TOTAL.labels(outcome=_outcome)
+
 OUTBOX_PENDING_GAUGE = Gauge(
     "aiops_outbox_pending_events",
     "Current backlog of PENDING transactional outbox events awaiting Redis Streams relay",

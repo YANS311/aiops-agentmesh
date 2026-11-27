@@ -62,6 +62,25 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
   FAILED: 'bg-red-500/20 text-red-300 border-red-500/50',
 };
 
+const OUTCOME_BADGE_STYLES: Record<string, { label: string; cls: string }> = {
+  SIMULATED: {
+    label: 'SIMULATED 模拟执行（未作用于真实生产）',
+    cls: 'bg-sky-500/20 text-sky-200 border-sky-400/40',
+  },
+  VERIFIED: {
+    label: 'VERIFIED 已后置验证',
+    cls: 'bg-emerald-500/20 text-emerald-300 border-emerald-500/50',
+  },
+  UNKNOWN: {
+    label: 'UNKNOWN 待人工对账',
+    cls: 'bg-orange-500/25 text-orange-200 border-orange-500/60',
+  },
+  FAILED: {
+    label: 'FAILED 执行失败',
+    cls: 'bg-red-500/25 text-red-200 border-red-500/60',
+  },
+};
+
 const REFRESH_TRIGGER_EVENTS = new Set([
   'SKILL_MATCHED',
   'TOOL_RESULT',
@@ -74,6 +93,10 @@ const REFRESH_TRIGGER_EVENTS = new Set([
   'REMEDIATION_PROPOSED',
   'APPROVAL_REQUIRED',
   'APPROVAL_GRANTED',
+  'REMEDIATION_SIMULATED',
+  'POST_CHECK_VERIFIED',
+  'POST_CHECK_UNKNOWN_RECONCILE_REQUIRED',
+  'POST_CHECK_FAILED',
   'HIGH_RISK_EXECUTED',
   'TRAJECTORY_ARCHIVED',
   'INCIDENT_RESOLVED',
@@ -376,6 +399,9 @@ export default function App() {
   const shapleyAttribution = ((detail?.trajectory?.trajectory_doc?.shapley_attribution ??
     detail?.blackboard?.shapley_attribution ??
     null) as ShapleyAttributionReport | null);
+  const executionOutcome = ((detail?.approval?.execution_result?.execution_outcome ??
+    detail?.blackboard?.execution_outcome ??
+    null) as string | null);
 
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
@@ -772,14 +798,24 @@ export default function App() {
                     <h2 className="text-xl font-semibold text-white">{detail.title}</h2>
                   </div>
 
-                  <span
-                    data-testid="incident-status-badge"
-                    className={`px-3 py-1 rounded-full text-xs font-bold tracking-wide border ${
-                      STATUS_BADGE_STYLES[detail.status] ?? 'bg-slate-700 text-slate-200'
-                    }`}
-                  >
-                    {detail.status}
-                  </span>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {executionOutcome && OUTCOME_BADGE_STYLES[executionOutcome] && (
+                      <span
+                        data-testid="execution-outcome-badge"
+                        className={`px-2.5 py-1 rounded-full text-[11px] font-semibold border ${OUTCOME_BADGE_STYLES[executionOutcome].cls}`}
+                      >
+                        {OUTCOME_BADGE_STYLES[executionOutcome].label}
+                      </span>
+                    )}
+                    <span
+                      data-testid="incident-status-badge"
+                      className={`px-3 py-1 rounded-full text-xs font-bold tracking-wide border ${
+                        STATUS_BADGE_STYLES[detail.status] ?? 'bg-slate-700 text-slate-200'
+                      }`}
+                    >
+                      {detail.status}
+                    </span>
+                  </div>
                 </div>
 
                 {detail.root_cause_summary && (
@@ -1040,6 +1076,27 @@ export default function App() {
                           <span className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-200 font-mono">
                             {ev.event_type}
                           </span>
+                          {typeof ev.payload?.evidence_source === 'string' && (
+                            <span
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
+                                ev.payload.evidence_source === 'LIVE'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                  : 'bg-slate-800 text-amber-200 border-amber-500/30'
+                              }`}
+                            >
+                              {ev.payload.evidence_source === 'LIVE' ? 'LIVE 真实证据' : 'MOCK 合成数据'}
+                            </span>
+                          )}
+                          {typeof ev.payload?.execution_outcome === 'string' &&
+                            OUTCOME_BADGE_STYLES[ev.payload.execution_outcome] && (
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-semibold border ${
+                                  OUTCOME_BADGE_STYLES[ev.payload.execution_outcome].cls
+                                }`}
+                              >
+                                {OUTCOME_BADGE_STYLES[ev.payload.execution_outcome].label}
+                              </span>
+                            )}
                         </div>
                         <span
                           className={`px-2 py-0.5 rounded-full font-semibold ${
@@ -1079,8 +1136,31 @@ export default function App() {
 
                 {Object.keys(evidence).length > 0 && (
                   <div>
-                    <div className="text-xs font-medium text-slate-400 mb-1.5">
-                      PG16 共享黑板只读诊断证据
+                    <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                      <span className="text-xs font-medium text-slate-400">
+                        PG16 共享黑板只读诊断证据
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {Object.entries(evidence).map(([k, val]) => {
+                          const src =
+                            val && typeof val === 'object' && 'evidence_source' in val
+                              ? String((val as Record<string, unknown>).evidence_source)
+                              : 'MOCK';
+                          return (
+                            <span
+                              key={k}
+                              data-testid={`evidence-source-badge-${k}`}
+                              className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                                src === 'LIVE'
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                  : 'bg-slate-800 text-amber-200 border-amber-500/40'
+                              }`}
+                            >
+                              {k}: {src === 'LIVE' ? 'LIVE 真实证据' : 'MOCK 合成数据'}
+                            </span>
+                          );
+                        })}
+                      </div>
                     </div>
                     <pre className="text-xs font-mono bg-slate-950 border border-slate-800 rounded-lg p-3 overflow-x-auto text-cyan-200">
                       {JSON.stringify(evidence, null, 2)}

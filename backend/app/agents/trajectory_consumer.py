@@ -131,6 +131,14 @@ class TrajectoryStreamConsumer:
                         "skill_id": skill_id,
                         "root_cause": incident.root_cause_summary or "",
                         "evidence": (incident.blackboard or {}).get("evidence", {}),
+                        "evidence_sources": {
+                            k: (v.get("evidence_source", "MOCK") if isinstance(v, dict) else "MOCK")
+                            for k, v in ((incident.blackboard or {}).get("evidence", {}) or {}).items()
+                        },
+                        "execution_outcome": exec_result.get(
+                            "execution_outcome",
+                            (incident.blackboard or {}).get("execution_outcome", "SIMULATED"),
+                        ),
                         "consensus_report": (incident.blackboard or {}).get("consensus_report"),
                         "shapley_attribution": (incident.blackboard or {}).get("shapley_attribution"),
                         "approval_audit": {
