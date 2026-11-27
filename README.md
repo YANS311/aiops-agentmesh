@@ -52,29 +52,78 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
 - **FastAPI Backend**: `http://127.0.0.1:8016`
 - **Vite React Console**: `http://127.0.0.1:5176` (proxies `/api` -> `http://127.0.0.1:8016`)
 
-## Quickstart
+## Quickstart (macOS / Linux / Windows)
+
+### Option A: One-Command Docker Stack (Recommended, Cross-Platform)
+
+Works identically on **macOS, Linux, and Windows** (no local Python or Node setup required):
 
 ```bash
-# 1. Start PostgreSQL 16 + Redis 7
+cp .env.example .env
+LLM_PROVIDER=mock TOOL_EXECUTION_MODE=live docker compose -f docker-compose.prod.yml up -d --build --wait
+# Open http://127.0.0.1:8088/
+```
+
+### Option B: Local Development Setup
+
+#### 1. Start Infrastructure & Initialize Environment
+
+```bash
+# macOS / Linux
+cp .env.example .env
 docker compose up -d --wait
+```
 
-# 2. Run Backend Tests (real PG16 + Redis, 0 SQLite)
+```powershell
+# Windows (PowerShell)
+Copy-Item .env.example .env
+docker compose up -d --wait
+```
+
+#### 2. Backend Setup, Migration & Tests (`Python 3.12+`)
+
+```bash
+# macOS / Linux (bash / zsh)
 cd backend
-.\.venv\Scripts\pytest.exe
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
 
-# 3. Start FastAPI Control Plane
-.\.venv\Scripts\uvicorn.exe app.main:app --host 127.0.0.1 --port 8016
+alembic upgrade head
+pytest -v
+EMBEDDED_WORKERS=true uvicorn app.main:app --host 127.0.0.1 --port 8016
+```
 
-# 4. Start Frontend Console (new terminal)
+```powershell
+# Windows (PowerShell)
+cd backend
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
+
+alembic upgrade head
+pytest -v
+$env:EMBEDDED_WORKERS = "true"; uvicorn app.main:app --host 127.0.0.1 --port 8016
+```
+
+#### 3. Frontend Console (`Node 20+`, new terminal)
+
+```bash
 cd frontend
+npm ci
 npm run dev
+# Open http://127.0.0.1:5176/
+```
 
-# 5. Run Concurrency & Reliability Load Benchmark (LLM_PROVIDER=mock, real PG16 + Redis 7)
+#### 4. Benchmarks & Real LLM Evaluation (with `.venv` activated)
+
+```bash
 cd backend
-.\.venv\Scripts\python.exe benchmarks\run_load_benchmark.py --tiers 10 30 50 --workers 4 --archivers 2
+# Concurrency & Reliability Load Benchmark (LLM_PROVIDER=mock, real PG16 + Redis 7)
+python benchmarks/run_load_benchmark.py --tiers 10 30 50 --workers 4 --archivers 2
 
-# 6. Run 12-Case Real DeepSeek Adversarial & Fault-Injection Eval (uses local .env)
-.\.venv\Scripts\python.exe benchmarks\run_llm_eval.py
+# 12-Case Real DeepSeek Adversarial & Fault-Injection Eval (uses local .env)
+python benchmarks/run_llm_eval.py
 ```
 
 ## Production Deployment (`docker-compose.prod.yml`)
