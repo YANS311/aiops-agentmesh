@@ -22,6 +22,7 @@ from app.agents.tools import (
     ToolRegistry,
 )
 from app.db.models import (
+    A2APeer,
     AgentTask,
     Incident,
     RemediationApproval,
@@ -202,6 +203,94 @@ class AIOpsOrchestrator:
                     input_payload={"fault_type": fault_type},
                 )
                 session.add(coord_task)
+                await session.flush()
+                incident_id = incident.id
+                blackboard_copy = dict(incident.blackboard)
+
+        await self._publish_pending(incident_id, pending_events, blackboard_copy)
+        self.notify_worker()
+        return incident
+
+    async def confirm_nl_incident(
+        self,
+        *,
+        query: str,
+        fault_type: str,
+        service_name: str,
+        matched_runbook: str,
+        target_a2a_peer: str | None,
+        suggested_skill: str | None,
+        severity: str,
+        parsed_summary: str,
+    ) -> Incident:
+        """Confirm a parsed natural-language troubleshooting draft and launch the pipeline."""
+        resolved_title = f"[{severity}] {parsed_summary[:180]}"
+        payload: dict[str, Any] = {
+            "source": "natural_language",
+            "nl_query": query,
+            "fault_type": fault_type,
+            "service_name": service_name,
+            "matched_runbook": matched_runbook,
+            "target_a2a_peer": target_a2a_peer,
+            "suggested_skill": suggested_skill,
+        }
+        pending_events: list[TraceEvent] = []
+        async with self.session_factory() as session:
+            async with session.begin():
+                incident = Incident(
+                    title=resolved_title,
+                    severity=severity,
+                    service_name=service_name,
+                    fault_type=fault_type,
+                    status="OPEN",
+                    alert_payload=payload,
+                    blackboard={
+                        "stage": "OPEN",
+                        "evidence": {},
+                        "nl_intent": {
+                            "query": query,
+                            "matched_runbook": matched_runbook,
+                            "target_a2a_peer": target_a2a_peer,
+                            "suggested_skill": suggested_skill,
+                            "parsed_summary": parsed_summary,
+                        },
+                    },
+                )
+                session.add(incident)
+                await session.flush()
+
+                pending_events.append(
+                    await append_trace_event(
+                        session,
+                        incident_id=incident.id,
+                        agent_role="SYSTEM",
+                        event_type="ALERT_INJECTED",
+                        risk_tier="NONE",
+                        summary=f"NL fault incident created: {resolved_title}",
+                        payload={"fault_type": fault_type, "service_name": service_name},
+                    )
+                )
+                pending_events.append(
+                    await append_trace_event(
+                        session,
+                        incident_id=incident.id,
+                        agent_role="SYSTEM",
+                        event_type="NL_INCIDENT_CONFIRMED",
+                        risk_tier="NONE",
+                        summary=f"User confirmed NL intent -> Runbook `{matched_runbook}` (peer={target_a2a_peer or 'auto'})",
+                        payload=payload,
+                    )
+                )
+                session.add(
+                    AgentTask(
+                        incident_id=incident.id,
+                        agent_role="COORDINATOR",
+                        step_order=10,
+                        action_type="ORCHESTRATE",
+                        status="QUEUED",
+                        input_payload={"fault_type": fault_type, "source": "natural_language"},
+                    )
+                )
                 await session.flush()
                 incident_id = incident.id
                 blackboard_copy = dict(incident.blackboard)
@@ -609,6 +698,18 @@ class AIOpsOrchestrator:
             skill=skill,
         )
 
+        merged_a2a_peers = list(self.a2a_peer_urls)
+        if plan.tool_name == "delegate_a2a_diagnosis":
+            db_peer_urls = (
+                await session.execute(
+                    select(A2APeer.base_url).where(A2APeer.enabled.is_(True))
+                )
+            ).scalars().all()
+            for u in db_peer_urls:
+                norm = u.strip().rstrip("/")
+                if norm and norm not in merged_a2a_peers:
+                    merged_a2a_peers.append(norm)
+
         spec, tool_output = await self.policy_guard.execute_authorized_async(
             agent_role=task.agent_role,
             tool_name=plan.tool_name,
@@ -621,7 +722,7 @@ class AIOpsOrchestrator:
                 "db_session": session,
                 "redis_client": self.redis_bus.redis,
                 "a2a_client": self.a2a_client,
-                "a2a_peer_urls": self.a2a_peer_urls,
+                "a2a_peer_urls": merged_a2a_peers,
             },
             approval=None,
         )

@@ -146,3 +146,47 @@ export interface IncidentDetail extends IncidentSummary {
   approval: RemediationApproval | null;
   trajectory: IncidentTrajectory | null;
 }
+
+export interface A2ASkillCard {
+  id: string;
+  name: string;
+  description: string;
+  permission: string;
+  tags?: string[];
+}
+
+export interface A2AAgentCard {
+  name: string;
+  description: string;
+  url: string;
+  version: string;
+  skills: A2ASkillCard[];
+}
+
+export interface A2APeerDiscoverResponse {
+  base_url: string;
+  card: A2AAgentCard;
+}
+
+export interface A2APeerOut {
+  id: string | null;
+  base_url: string;
+  status: string;
+  enabled: boolean;
+  source: string;
+  card: A2AAgentCard | null;
+  error: string | null;
+  created_by?: string | null;
+  created_at?: string | null;
+}
+
+export interface NLParseResponse {
+  query: string;
+  fault_type: string;
+  service_name: string;
+  matched_runbook: string;
+  target_a2a_peer: string | null;
+  suggested_skill: string | null;
+  severity: string;
+  parsed_summary: string;
+}

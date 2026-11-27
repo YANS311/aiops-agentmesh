@@ -165,6 +165,62 @@ class AlertmanagerWebhookResponse(BaseModel):
     results: list[AlertmanagerItemResult]
 
 
+class A2APeerDiscoverRequest(BaseModel):
+    base_url: str = Field(min_length=8, max_length=512)
+
+
+class A2APeerDiscoverResponse(BaseModel):
+    base_url: str
+    card: dict[str, Any]
+
+
+class A2APeerRegisterRequest(BaseModel):
+    base_url: str = Field(min_length=8, max_length=512)
+    enabled: bool = True
+
+
+class A2APeerToggleRequest(BaseModel):
+    enabled: bool
+
+
+class A2APeerOut(BaseModel):
+    id: UUID | None = None
+    base_url: str
+    status: str
+    enabled: bool = True
+    source: str = "db"
+    card: dict[str, Any] | None = None
+    error: str | None = None
+    created_by: str | None = None
+    created_at: datetime | None = None
+
+
+class NLParseRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=2000)
+
+
+class NLParseResponse(BaseModel):
+    query: str
+    fault_type: str
+    service_name: str
+    matched_runbook: str
+    target_a2a_peer: str | None = None
+    suggested_skill: str | None = None
+    severity: str = Field(default="P1", pattern="^(P0|P1|P2|P3)$")
+    parsed_summary: str
+
+
+class NLConfirmRequest(BaseModel):
+    query: str = Field(min_length=2, max_length=2000)
+    fault_type: str = Field(min_length=1, max_length=64)
+    service_name: str = Field(min_length=1, max_length=128)
+    matched_runbook: str = Field(min_length=1, max_length=128)
+    target_a2a_peer: str | None = Field(default=None, max_length=512)
+    suggested_skill: str | None = Field(default=None, max_length=128)
+    severity: str = Field(default="P1", pattern="^(P0|P1|P2|P3)$")
+    parsed_summary: str = Field(min_length=1, max_length=1000)
+
+
 class IncidentDetailOut(IncidentSummaryOut):
     tasks: list[AgentTaskOut]
     approval: ApprovalOut | None

@@ -63,6 +63,27 @@ class _SpecialistHypothesisSchema(BaseModel):
     evidence_summary: str = Field(min_length=1)
 
 
+@dataclass(frozen=True)
+class NLIncidentDraft:
+    fault_type: str
+    service_name: str
+    matched_runbook: str
+    target_a2a_peer: str | None
+    suggested_skill: str | None
+    severity: str
+    parsed_summary: str
+
+
+class _NLIncidentDraftSchema(BaseModel):
+    fault_type: str = Field(min_length=1)
+    service_name: str = Field(min_length=1)
+    matched_runbook: str = Field(min_length=1)
+    target_a2a_peer: str | None = None
+    suggested_skill: str | None = None
+    severity: str = Field(default="P1", pattern="^(P0|P1|P2|P3)$")
+    parsed_summary: str = Field(min_length=1)
+
+
 class LLMProvider(Protocol):
     async def plan_triage(
         self, *, fault_type: str, service_name: str, alert_payload: dict[str, Any], skill: RunbookSkill
@@ -92,6 +113,14 @@ class LLMProvider(Protocol):
         alert_payload: dict[str, Any],
         skill: RunbookSkill,
     ) -> RemediationProposal: ...
+
+    async def parse_nl_incident(
+        self,
+        *,
+        query: str,
+        skills: list[RunbookSkill],
+        available_peers: list[dict[str, Any]],
+    ) -> NLIncidentDraft: ...
 
 
 def _extract_json_object(raw_text: str) -> dict[str, Any]:
@@ -341,6 +370,48 @@ class OpenAICompatibleLLMProvider:
             rationale=validated.rationale,
         )
 
+    async def parse_nl_incident(
+        self,
+        *,
+        query: str,
+        skills: list[RunbookSkill],
+        available_peers: list[dict[str, Any]],
+    ) -> NLIncidentDraft:
+        system_prompt = (
+            "你是 AIOps 自然语言排障意图解析智能体。请根据用户输入、可用 Runbook Skill 与已注册 A2A 节点，"
+            "输出严格 JSON 对象，包含："
+            '"fault_type", "service_name", "matched_runbook", "target_a2a_peer", '
+            '"suggested_skill", "severity" (P0|P1|P2|P3), "parsed_summary"（简体中文摘要）。'
+        )
+        user_payload = {
+            "query": query,
+            "runbooks": [
+                {
+                    "skill_id": s.skill_id,
+                    "fault_type": s.fault_type,
+                    "default_service": s.default_service,
+                    "default_severity": s.default_severity,
+                }
+                for s in skills
+            ],
+            "available_a2a_peers": available_peers,
+        }
+        validated = await self._complete_json(
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            schema=_NLIncidentDraftSchema,
+        )
+        assert isinstance(validated, _NLIncidentDraftSchema)
+        return NLIncidentDraft(
+            fault_type=validated.fault_type,
+            service_name=validated.service_name,
+            matched_runbook=validated.matched_runbook,
+            target_a2a_peer=validated.target_a2a_peer,
+            suggested_skill=validated.suggested_skill,
+            severity=validated.severity,
+            parsed_summary=validated.parsed_summary,
+        )
+
 
 class MockLLMProvider:
     """Deterministic, fault-injectable LLM provider for zero-cost automated verification."""
@@ -587,6 +658,56 @@ class MockLLMProvider:
                 f"Correlated {skill.diagnostic_tools.log_agent} + {skill.diagnostic_tools.db_agent} "
                 f"evidence under {skill.skill_id}. High-risk write action requires human approval."
             ),
+        )
+
+    async def parse_nl_incident(
+        self,
+        *,
+        query: str,
+        skills: list[RunbookSkill],
+        available_peers: list[dict[str, Any]],
+    ) -> NLIncidentDraft:
+        q = query.lower()
+        if any(k in q for k in ("neo4j", "cypher", "图谱", "知识图谱")):
+            fault_type = "guidance_neo4j_slow_cypher"
+            suggested_skill: str | None = "diagnose_neo4j_cypher"
+            summary = "识别为学院智能导学 Neo4j 知识图谱慢 Cypher / 连接池耗尽故障，将通过 A2A 委派只读图谱诊断。"
+        elif any(k in q for k in ("rag", "召回", "向量", "检索", "milvus")):
+            fault_type = "guidance_rag_retrieval_degradation"
+            suggested_skill = "diagnose_rag_pipeline"
+            summary = "识别为学院智能导学 RAG 检索延迟飙升 / 空召回率异常，将通过 A2A 委派只读检索链路诊断。"
+        elif any(k in q for k in ("redis", "缓存", "击穿", "stampede", "热点")):
+            fault_type = "redis_cache_stampede"
+            suggested_skill = None
+            summary = "识别为 Redis 热点 Key 失效引发的缓存击穿故障，将启动只读日志与缓存探针排查。"
+        elif any(k in q for k in ("锁", "lock", "慢sql", "slow sql")):
+            fault_type = "slow_sql_lock_contention"
+            suggested_skill = None
+            summary = "识别为 PostgreSQL 16 慢 SQL 锁争用故障，将启动锁树与慢查询诊断。"
+        else:
+            fault_type = "db_connection_pool_exhausted"
+            suggested_skill = None
+            summary = "识别为 PostgreSQL 16 连接池耗尽故障，将启动只读连接状态与错误日志排查。"
+
+        matched = next((s for s in skills if s.fault_type == fault_type), skills[0])
+        target_peer: str | None = None
+        if suggested_skill:
+            for peer in available_peers:
+                card = peer.get("card") or {}
+                skill_ids = {sk.get("id") for sk in (card.get("skills") or [])}
+                if suggested_skill in skill_ids:
+                    target_peer = str(peer.get("base_url"))
+                    break
+
+        severity = "P0" if any(k in q for k in ("p0", "紧急", "崩溃", "瘫痪", "不可用")) else matched.default_severity
+        return NLIncidentDraft(
+            fault_type=matched.fault_type,
+            service_name=matched.default_service,
+            matched_runbook=matched.skill_id,
+            target_a2a_peer=target_peer,
+            suggested_skill=suggested_skill,
+            severity=severity,
+            parsed_summary=summary,
         )
 
 

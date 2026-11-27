@@ -1,12 +1,14 @@
 import hashlib
 import json
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 
+from app.a2a.client import A2AClientError
 from app.a2a.models import AgentCard, AgentCapabilities, AgentSkillCard
 from app.agents.orchestrator import (
     TERMINAL_INCIDENT_STATUSES,
@@ -17,6 +19,11 @@ from app.agents.orchestrator import (
     serialize_trace_event,
 )
 from app.api.schemas import (
+    A2APeerDiscoverRequest,
+    A2APeerDiscoverResponse,
+    A2APeerOut,
+    A2APeerRegisterRequest,
+    A2APeerToggleRequest,
     ActorOut,
     AlertmanagerItemResult,
     AlertmanagerWebhookPayload,
@@ -26,12 +33,15 @@ from app.api.schemas import (
     IncidentDetailOut,
     IncidentSummaryOut,
     InjectIncidentRequest,
+    NLConfirmRequest,
+    NLParseRequest,
+    NLParseResponse,
     SkillOut,
     TraceEventOut,
     TrajectoryOut,
 )
 from app.auth.rbac import Actor, require_authenticated, require_sre_approver
-from app.db.models import Incident
+from app.db.models import A2APeer, Incident
 from app.db.repositories import (
     get_incident_full,
     get_trajectory_by_incident,
@@ -65,20 +75,192 @@ async def get_current_actor(actor: Actor = Depends(require_authenticated)) -> Ac
     return ActorOut(actor_id=actor.actor_id, role=actor.role.value)
 
 
-@router.get("/a2a/peers")
-async def list_a2a_peers(request: Request) -> list[dict[str, Any]]:
+def _validate_peer_base_url(raw_url: str) -> str:
+    cleaned = raw_url.strip().rstrip("/")
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid A2A peer URL: must be http:// or https:// with a valid host.",
+        )
+    return cleaned
+
+
+@router.post("/a2a/peers/discover", response_model=A2APeerDiscoverResponse)
+async def discover_a2a_peer(
+    body: A2APeerDiscoverRequest, request: Request
+) -> A2APeerDiscoverResponse:
+    base_url = _validate_peer_base_url(body.base_url)
     a2a_client = request.app.state.a2a_client
-    peer_urls: list[str] = request.app.state.a2a_peer_urls
-    discovered = await a2a_client.discover_peers(peer_urls, use_cache=True)
-    return [
-        {
-            "base_url": item.base_url,
-            "status": item.status,
-            "card": item.card.model_dump(mode="json") if item.card else None,
-            "error": item.error,
-        }
-        for item in discovered
-    ]
+    try:
+        card = await a2a_client.discover_agent_card(base_url, use_cache=False)
+    except A2AClientError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+    return A2APeerDiscoverResponse(base_url=base_url, card=card.model_dump(mode="json"))
+
+
+@router.post("/a2a/peers", response_model=A2APeerOut, status_code=status.HTTP_201_CREATED)
+async def register_a2a_peer(
+    body: A2APeerRegisterRequest,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
+) -> A2APeerOut:
+    base_url = _validate_peer_base_url(body.base_url)
+    a2a_client = request.app.state.a2a_client
+    try:
+        card = await a2a_client.discover_agent_card(base_url, use_cache=False)
+    except A2AClientError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+    card_dict = card.model_dump(mode="json")
+    async with request.app.state.session_factory() as session:
+        async with session.begin():
+            existing = (
+                await session.execute(select(A2APeer).where(A2APeer.base_url == base_url))
+            ).scalar_one_or_none()
+            if existing is not None:
+                existing.name = card.name
+                existing.description = card.description
+                existing.version = card.version
+                existing.agent_card = card_dict
+                existing.enabled = body.enabled
+                existing.created_by = actor.actor_id
+                peer = existing
+            else:
+                peer = A2APeer(
+                    base_url=base_url,
+                    name=card.name,
+                    description=card.description,
+                    version=card.version,
+                    agent_card=card_dict,
+                    enabled=body.enabled,
+                    created_by=actor.actor_id,
+                )
+                session.add(peer)
+            await session.flush()
+            await session.refresh(peer)
+
+    return A2APeerOut(
+        id=peer.id,
+        base_url=peer.base_url,
+        status="ONLINE" if peer.enabled else "DISABLED",
+        enabled=peer.enabled,
+        source="db",
+        card=peer.agent_card,
+        error=None,
+        created_by=peer.created_by,
+        created_at=peer.created_at,
+    )
+
+
+@router.get("/a2a/peers", response_model=list[A2APeerOut])
+async def list_a2a_peers(request: Request) -> list[A2APeerOut]:
+    a2a_client = request.app.state.a2a_client
+    env_urls: list[str] = request.app.state.a2a_peer_urls
+
+    async with request.app.state.session_factory() as session:
+        db_peers = (
+            await session.execute(select(A2APeer).order_by(A2APeer.created_at.desc()))
+        ).scalars().all()
+
+    results: list[A2APeerOut] = []
+    seen_urls: set[str] = set()
+
+    for p in db_peers:
+        seen_urls.add(p.base_url.rstrip("/"))
+        peer_status = "DISABLED"
+        error_msg: str | None = None
+        card_data = p.agent_card
+        if p.enabled:
+            try:
+                live_card = await a2a_client.discover_agent_card(p.base_url, use_cache=True)
+                card_data = live_card.model_dump(mode="json")
+                peer_status = "ONLINE"
+            except A2AClientError as exc:
+                peer_status = "UNREACHABLE"
+                error_msg = exc.message
+        results.append(
+            A2APeerOut(
+                id=p.id,
+                base_url=p.base_url,
+                status=peer_status,
+                enabled=p.enabled,
+                source="db",
+                card=card_data,
+                error=error_msg,
+                created_by=p.created_by,
+                created_at=p.created_at,
+            )
+        )
+
+    remaining_env = [u for u in env_urls if u.strip().rstrip("/") not in seen_urls]
+    if remaining_env:
+        discovered = await a2a_client.discover_peers(remaining_env, use_cache=True)
+        for item in discovered:
+            results.append(
+                A2APeerOut(
+                    id=None,
+                    base_url=item.base_url,
+                    status=item.status,
+                    enabled=True,
+                    source="env",
+                    card=item.card.model_dump(mode="json") if item.card else None,
+                    error=item.error,
+                )
+            )
+    return results
+
+
+@router.patch("/a2a/peers/{peer_id}", response_model=A2APeerOut)
+async def toggle_a2a_peer(
+    peer_id: UUID,
+    body: A2APeerToggleRequest,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
+) -> A2APeerOut:
+    async with request.app.state.session_factory() as session:
+        async with session.begin():
+            peer = (
+                await session.execute(select(A2APeer).where(A2APeer.id == peer_id))
+            ).scalar_one_or_none()
+            if peer is None:
+                raise HTTPException(status_code=404, detail="A2A peer not found")
+            peer.enabled = body.enabled
+            await session.flush()
+            await session.refresh(peer)
+    return A2APeerOut(
+        id=peer.id,
+        base_url=peer.base_url,
+        status="ONLINE" if peer.enabled else "DISABLED",
+        enabled=peer.enabled,
+        source="db",
+        card=peer.agent_card,
+        created_by=peer.created_by,
+        created_at=peer.created_at,
+    )
+
+
+@router.delete("/a2a/peers/{peer_id}")
+async def delete_a2a_peer(
+    peer_id: UUID,
+    request: Request,
+    actor: Actor = Depends(require_sre_approver),
+) -> dict[str, str]:
+    async with request.app.state.session_factory() as session:
+        async with session.begin():
+            peer = (
+                await session.execute(select(A2APeer).where(A2APeer.id == peer_id))
+            ).scalar_one_or_none()
+            if peer is None:
+                raise HTTPException(status_code=404, detail="A2A peer not found")
+            await session.delete(peer)
+    return {"status": "deleted", "id": str(peer_id)}
 
 
 @router.get("/skills", response_model=list[SkillOut])
@@ -113,6 +295,52 @@ async def inject_incident(body: InjectIncidentRequest, request: Request) -> Inci
         service_name=body.service_name,
         alert_payload=body.alert_payload,
         idempotency_key=body.idempotency_key,
+    )
+    return IncidentSummaryOut.model_validate(incident)
+
+
+@router.post("/incidents/nl/parse", response_model=NLParseResponse)
+async def parse_nl_incident_intent(
+    body: NLParseRequest, request: Request
+) -> NLParseResponse:
+    orch = _get_orchestrator(request)
+    peers = await list_a2a_peers(request)
+    available_peers = [
+        {"base_url": p.base_url, "card": p.card}
+        for p in peers
+        if p.enabled and p.card is not None
+    ]
+    draft = await orch.llm.parse_nl_incident(
+        query=body.query,
+        skills=request.app.state.skill_registry.list_skills(),
+        available_peers=available_peers,
+    )
+    return NLParseResponse(
+        query=body.query,
+        fault_type=draft.fault_type,
+        service_name=draft.service_name,
+        matched_runbook=draft.matched_runbook,
+        target_a2a_peer=draft.target_a2a_peer,
+        suggested_skill=draft.suggested_skill,
+        severity=draft.severity,
+        parsed_summary=draft.parsed_summary,
+    )
+
+
+@router.post("/incidents/nl/confirm", response_model=IncidentSummaryOut, status_code=status.HTTP_201_CREATED)
+async def confirm_nl_incident_intent(
+    body: NLConfirmRequest, request: Request
+) -> IncidentSummaryOut:
+    orch = _get_orchestrator(request)
+    incident = await orch.confirm_nl_incident(
+        query=body.query,
+        fault_type=body.fault_type,
+        service_name=body.service_name,
+        matched_runbook=body.matched_runbook,
+        target_a2a_peer=body.target_a2a_peer,
+        suggested_skill=body.suggested_skill,
+        severity=body.severity,
+        parsed_summary=body.parsed_summary,
     )
     return IncidentSummaryOut.model_validate(incident)
 

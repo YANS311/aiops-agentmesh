@@ -1,8 +1,11 @@
 import type {
+  A2APeerDiscoverResponse,
+  A2APeerOut,
   ActorInfo,
   HealthResponse,
   IncidentDetail,
   IncidentSummary,
+  NLParseResponse,
   SkillOut,
 } from './types';
 
@@ -89,4 +92,56 @@ export async function rejectIncident(
     body: JSON.stringify({ operator, comment }),
   });
   return parseJsonOrThrow<IncidentDetail>(resp);
+}
+
+export async function fetchA2APeers(): Promise<A2APeerOut[]> {
+  const resp = await fetch('/api/v1/a2a/peers');
+  return parseJsonOrThrow<A2APeerOut[]>(resp);
+}
+
+export async function discoverA2APeer(baseUrl: string): Promise<A2APeerDiscoverResponse> {
+  const resp = await fetch('/api/v1/a2a/peers/discover', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ base_url: baseUrl }),
+  });
+  return parseJsonOrThrow<A2APeerDiscoverResponse>(resp);
+}
+
+export async function registerA2APeer(
+  baseUrl: string,
+  token: string
+): Promise<A2APeerOut> {
+  const resp = await fetch('/api/v1/a2a/peers', {
+    method: 'POST',
+    headers: authHeaders(token),
+    body: JSON.stringify({ base_url: baseUrl, enabled: true }),
+  });
+  return parseJsonOrThrow<A2APeerOut>(resp);
+}
+
+export async function deleteA2APeer(peerId: string, token: string): Promise<void> {
+  const resp = await fetch(`/api/v1/a2a/peers/${peerId}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  await parseJsonOrThrow<{ status: string }>(resp);
+}
+
+export async function parseNLIntent(query: string): Promise<NLParseResponse> {
+  const resp = await fetch('/api/v1/incidents/nl/parse', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify({ query }),
+  });
+  return parseJsonOrThrow<NLParseResponse>(resp);
+}
+
+export async function confirmNLIntent(draft: NLParseResponse): Promise<IncidentSummary> {
+  const resp = await fetch('/api/v1/incidents/nl/confirm', {
+    method: 'POST',
+    headers: authHeaders(),
+    body: JSON.stringify(draft),
+  });
+  return parseJsonOrThrow<IncidentSummary>(resp);
 }

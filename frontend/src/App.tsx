@@ -6,30 +6,44 @@ import {
   BarChart3,
   CheckCircle2,
   Database,
+  Globe,
   Play,
+  Plus,
   Scale,
+  Search,
   ShieldAlert,
   ShieldCheck,
+  Sparkles,
   Terminal,
+  Trash2,
   XCircle,
 } from 'lucide-react';
 import {
   ROLE_TOKENS,
   approveIncident,
+  confirmNLIntent,
+  deleteA2APeer,
+  discoverA2APeer,
+  fetchA2APeers,
   fetchCurrentActor,
   fetchHealth,
   fetchIncidentDetail,
   fetchIncidents,
   fetchSkills,
   injectFault,
+  parseNLIntent,
+  registerA2APeer,
   rejectIncident,
 } from './api';
 import type {
+  A2APeerDiscoverResponse,
+  A2APeerOut,
   ActorInfo,
   ConsensusReport,
   HealthResponse,
   IncidentDetail,
   IncidentSummary,
+  NLParseResponse,
   RoleType,
   ShapleyAttributionReport,
   SkillOut,
@@ -51,6 +65,10 @@ const STATUS_BADGE_STYLES: Record<string, string> = {
 const REFRESH_TRIGGER_EVENTS = new Set([
   'SKILL_MATCHED',
   'TOOL_RESULT',
+  'NL_INCIDENT_CONFIRMED',
+  'A2A_TASK_DELEGATED',
+  'A2A_TASK_COMPLETED',
+  'A2A_TASK_FAILED',
   'CONSENSUS_REACHED',
   'CONSENSUS_CONFLICT_ALERT',
   'REMEDIATION_PROPOSED',
@@ -81,6 +99,14 @@ export default function App() {
   const [busyAction, setBusyAction] = useState<boolean>(false);
   const [uiError, setUiError] = useState<string | null>(null);
 
+  // Phase 6.1 A2A Peer Registration & NL Troubleshooting states
+  const [a2aEndpoint, setA2aEndpoint] = useState<string>('http://127.0.0.1:8020');
+  const [a2aPreview, setA2aPreview] = useState<A2APeerDiscoverResponse | null>(null);
+  const [a2aPeers, setA2aPeers] = useState<A2APeerOut[]>([]);
+  const [a2aNotice, setA2aNotice] = useState<string | null>(null);
+  const [nlQuery, setNlQuery] = useState<string>('');
+  const [nlDraft, setNlDraft] = useState<NLParseResponse | null>(null);
+
   const refreshListAndDetail = useCallback(async (targetId: string | null) => {
     try {
       const list = await fetchIncidents();
@@ -98,15 +124,17 @@ export default function App() {
     let active = true;
     (async () => {
       try {
-        const [h, s, list] = await Promise.all([
+        const [h, s, list, peers] = await Promise.all([
           fetchHealth(),
           fetchSkills(),
           fetchIncidents(),
+          fetchA2APeers(),
         ]);
         if (!active) return;
         setHealth(h);
         setSkills(s);
         setIncidents(list);
+        setA2aPeers(peers);
         if (list.length > 0) {
           setSelectedId(list[0].id);
         }
@@ -193,6 +221,90 @@ export default function App() {
     setUiError(null);
     try {
       const created = await injectFault(selectedFault);
+      setSelectedId(created.id);
+      await refreshListAndDetail(created.id);
+    } catch (err) {
+      setUiError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleDiscoverA2A = async () => {
+    setBusyAction(true);
+    setUiError(null);
+    setA2aNotice(null);
+    try {
+      const preview = await discoverA2APeer(a2aEndpoint);
+      setA2aPreview(preview);
+    } catch (err) {
+      setA2aPreview(null);
+      setUiError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleRegisterA2A = async () => {
+    setUiError(null);
+    if (activeRole !== 'SRE_APPROVER') {
+      setA2aNotice(
+        `权限不足（RBAC 拦截）：当前身份 ${actorInfo?.actor_id ?? 'viewer-demo-01'} (VIEWER) 无权接入外部 A2A 节点，请先在顶栏切换为 SRE_APPROVER。`
+      );
+      return;
+    }
+    setBusyAction(true);
+    setA2aNotice(null);
+    try {
+      await registerA2APeer(a2aEndpoint, ROLE_TOKENS[activeRole]);
+      const updatedPeers = await fetchA2APeers();
+      setA2aPeers(updatedPeers);
+      setA2aPreview(null);
+      setA2aNotice(`已成功接入 A2A 节点：${a2aEndpoint}`);
+    } catch (err) {
+      setUiError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleDeleteA2A = async (peerId: string) => {
+    if (activeRole !== 'SRE_APPROVER') {
+      setA2aNotice('权限不足：删除 A2A 节点需切换为 SRE_APPROVER。');
+      return;
+    }
+    setBusyAction(true);
+    try {
+      await deleteA2APeer(peerId, ROLE_TOKENS[activeRole]);
+      setA2aPeers(await fetchA2APeers());
+    } catch (err) {
+      setUiError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleParseNL = async () => {
+    if (!nlQuery.trim()) return;
+    setBusyAction(true);
+    setUiError(null);
+    try {
+      const draft = await parseNLIntent(nlQuery.trim());
+      setNlDraft(draft);
+    } catch (err) {
+      setUiError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusyAction(false);
+    }
+  };
+
+  const handleConfirmNL = async () => {
+    if (!nlDraft) return;
+    setBusyAction(true);
+    setUiError(null);
+    try {
+      const created = await confirmNLIntent(nlDraft);
+      setNlDraft(null);
       setSelectedId(created.id);
       await refreshListAndDetail(created.id);
     } catch (err) {
@@ -368,6 +480,220 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Phase 6.1 Top Action Strip: A2A Peer Registration + Natural Language Troubleshooting */}
+      <section className="max-w-7xl w-full mx-auto px-6 pt-5 grid grid-cols-1 lg:grid-cols-2 gap-5">
+        {/* Panel 1: A2A External Agent Onboarding */}
+        <div
+          data-testid="a2a-onboarding-panel"
+          className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-3"
+        >
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Globe className="h-4 w-4 text-cyan-400" />
+              A2A 外部智能体接入
+            </h2>
+            <span className="text-xs text-slate-400">已接入 {a2aPeers.length} 个节点</span>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <input
+              type="text"
+              data-testid="a2a-endpoint-input"
+              value={a2aEndpoint}
+              onChange={(e) => setA2aEndpoint(e.target.value)}
+              placeholder="http://127.0.0.1:8020"
+              className="flex-1 min-w-[200px] rounded-lg bg-slate-950 border border-slate-700 px-3 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:ring-2 focus:ring-cyan-500"
+            />
+            <button
+              type="button"
+              data-testid="a2a-discover-btn"
+              onClick={handleDiscoverA2A}
+              disabled={busyAction}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-xs font-medium text-slate-100 transition cursor-pointer"
+            >
+              <Search className="h-3.5 w-3.5 text-cyan-400" />
+              探测 Agent Card
+            </button>
+          </div>
+
+          {a2aPreview && (
+            <div
+              data-testid="a2a-preview-card"
+              className="rounded-lg border border-cyan-500/40 bg-cyan-950/20 p-3 space-y-2 text-xs"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <span className="font-semibold text-cyan-200">{a2aPreview.card.name}</span>
+                  <span className="ml-2 font-mono text-slate-400">v{a2aPreview.card.version}</span>
+                </div>
+                <button
+                  type="button"
+                  data-testid="a2a-register-btn"
+                  onClick={handleRegisterA2A}
+                  disabled={busyAction}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold cursor-pointer"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  确认接入
+                </button>
+              </div>
+              <p className="text-slate-300">{a2aPreview.card.description}</p>
+              <div className="flex flex-wrap gap-1.5">
+                {a2aPreview.card.skills.map((sk) => (
+                  <span
+                    key={sk.id}
+                    className="px-2 py-0.5 rounded bg-slate-900 border border-cyan-500/30 text-cyan-300 font-mono text-[11px]"
+                  >
+                    {sk.id} ({sk.permission})
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {a2aNotice && (
+            <div className="rounded-lg border border-amber-500/40 bg-amber-950/30 px-3 py-2 text-xs text-amber-200">
+              {a2aNotice}
+            </div>
+          )}
+
+          <div data-testid="a2a-peers-list" className="space-y-1.5 max-h-28 overflow-y-auto">
+            {a2aPeers.length === 0 ? (
+              <div className="text-xs text-slate-500">
+                暂无已注册外部 A2A 节点，输入 Endpoint 并探测即可接入。
+              </div>
+            ) : (
+              a2aPeers.map((peer) => (
+                <div
+                  key={peer.id ?? peer.base_url}
+                  className="flex items-center justify-between gap-2 rounded-lg border border-slate-800 bg-slate-950/60 px-2.5 py-1.5 text-xs"
+                >
+                  <div className="min-w-0">
+                    <div className="font-mono text-slate-200 truncate">
+                      {peer.card?.name ?? peer.base_url}
+                    </div>
+                    <div className="text-[11px] text-slate-400 truncate">{peer.base_url}</div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <span
+                      className={`px-2 py-0.5 rounded-full text-[10px] font-semibold border ${
+                        peer.status === 'ONLINE'
+                          ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                          : 'bg-slate-800 text-slate-400 border-slate-700'
+                      }`}
+                    >
+                      {peer.status}
+                    </span>
+                    {peer.id && (
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteA2A(peer.id!)}
+                        className="text-slate-500 hover:text-rose-400 cursor-pointer"
+                        title="移除节点"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        {/* Panel 2: Natural Language Troubleshooting */}
+        <div
+          data-testid="nl-troubleshooting-panel"
+          className="rounded-xl border border-slate-800 bg-slate-900/70 p-4 space-y-3"
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+              <Sparkles className="h-4 w-4 text-indigo-400" />
+              自然语言排障
+            </h2>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                data-testid="nl-example-neo4j"
+                onClick={() =>
+                  setNlQuery('学院智能导学 Neo4j 知识图谱 Cypher 查询超时，连接池接近打满，请帮忙排查')
+                }
+                className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-indigo-300 border border-slate-700 cursor-pointer"
+              >
+                示例：导学 Neo4j 慢查询
+              </button>
+              <button
+                type="button"
+                data-testid="nl-example-rag"
+                onClick={() =>
+                  setNlQuery('学院导学 RAG 检索延迟飙升，空召回率超过 30%，请立即诊断向量检索链路')
+                }
+                className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-[11px] text-cyan-300 border border-slate-700 cursor-pointer"
+              >
+                示例：RAG 空召回
+              </button>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            <input
+              type="text"
+              data-testid="nl-query-input"
+              value={nlQuery}
+              onChange={(e) => setNlQuery(e.target.value)}
+              placeholder="用自然语言描述线上故障，例如：导学 Neo4j 图谱慢查询..."
+              className="flex-1 min-w-[220px] rounded-lg bg-slate-950 border border-slate-700 px-3 py-1.5 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+            />
+            <button
+              type="button"
+              data-testid="nl-parse-btn"
+              onClick={handleParseNL}
+              disabled={busyAction || !nlQuery.trim()}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-xs font-medium text-white transition cursor-pointer"
+            >
+              解析意图
+            </button>
+          </div>
+
+          {nlDraft && (
+            <div
+              data-testid="nl-preview-card"
+              className="rounded-lg border border-indigo-500/40 bg-indigo-950/20 p-3 space-y-2 text-xs"
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-indigo-200">
+                  意图确认卡 • [{nlDraft.severity}] {nlDraft.service_name}
+                </span>
+                <button
+                  type="button"
+                  data-testid="nl-confirm-btn"
+                  onClick={handleConfirmNL}
+                  disabled={busyAction}
+                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-semibold cursor-pointer"
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  确认发起排障
+                </button>
+              </div>
+              <p className="text-slate-300">{nlDraft.parsed_summary}</p>
+              <div className="flex flex-wrap gap-2 text-[11px] font-mono text-slate-300">
+                <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700">
+                  Runbook: {nlDraft.matched_runbook}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700">
+                  A2A 节点: {nlDraft.target_a2a_peer ?? '自动匹配'}
+                </span>
+                {nlDraft.suggested_skill && (
+                  <span className="px-2 py-0.5 rounded bg-slate-900 border border-slate-700">
+                    Skill: {nlDraft.suggested_skill}
+                  </span>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
 
       {/* Main Content */}
       <main className="max-w-7xl w-full mx-auto flex-1 grid grid-cols-1 lg:grid-cols-12 gap-6 p-6">

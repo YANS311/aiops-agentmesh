@@ -198,6 +198,7 @@ async def test_alembic_upgrade_head_on_brand_new_empty_pg16_database() -> None:
                     "trace_events",
                     "incident_trajectories",
                     "outbox_events",
+                    "a2a_peers",
                     "alembic_version",
                 }.issubset(tables)
 

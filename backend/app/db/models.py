@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     BigInteger,
+    Boolean,
     DateTime,
     ForeignKey,
     Identity,
@@ -231,4 +232,27 @@ class IncidentTrajectory(Base):
 
     __table_args__ = (
         Index("ix_incident_trajectories_doc_gin", "trajectory_doc", postgresql_using="gin"),
+    )
+
+
+class A2APeer(Base):
+    """Persisted external A2A peer agent registered via the control plane."""
+
+    __tablename__ = "a2a_peers"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    base_url: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    version: Mapped[str] = mapped_column(String(32), nullable=False, default="1.0.0")
+    agent_card: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
