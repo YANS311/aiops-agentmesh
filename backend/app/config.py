@@ -32,7 +32,13 @@ class Settings(BaseSettings):
     auto_init_db: bool = False
     embedded_workers: bool = False
     tool_execution_mode: str = "mock"
+    a2a_peer_urls: str = ""
+    a2a_auth_token: str = ""
+    a2a_timeout_seconds: float = 5.0
     skills_dir: Path = Path(__file__).resolve().parents[1] / "skills"
+
+    def parsed_a2a_peer_urls(self) -> list[str]:
+        return [item.strip().rstrip("/") for item in self.a2a_peer_urls.split(",") if item.strip()]
 
 
 @lru_cache

@@ -3,9 +3,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 import inspect
 from typing import Any, Callable
+from uuid import uuid4
 
 from sqlalchemy import text
 
+from app.a2a.client import A2AClient, A2AClientError
+from app.a2a.models import A2ATaskRequest
 from app.db.models import Incident, RemediationApproval
 
 
@@ -306,6 +309,128 @@ def _enable_singleflight_and_prewarm_hotkey(ctx: dict[str, Any]) -> dict[str, An
     }
 
 
+def _create_neo4j_index_and_throttle_cypher(ctx: dict[str, Any]) -> dict[str, Any]:
+    service = ctx.get("service_name", "guidance-knowledge-graph")
+    return {
+        "executed_tool": "create_neo4j_index_and_throttle_cypher",
+        "service": service,
+        "created_indexes": ["idx_concept_course_id"],
+        "cypher_max_concurrent": 16,
+        "post_check_p99_cypher_ms": 185,
+        "status": "SUCCESS",
+    }
+
+
+def _tune_rag_retrieval_and_enable_degrade(ctx: dict[str, Any]) -> dict[str, Any]:
+    service = ctx.get("service_name", "guidance-rag-service")
+    return {
+        "executed_tool": "tune_rag_retrieval_and_enable_degrade",
+        "service": service,
+        "efSearch": 128,
+        "top_k": 8,
+        "bm25_fallback": True,
+        "post_check_rag_p99_ms": 410,
+        "status": "SUCCESS",
+    }
+
+
+def _delegate_a2a_diagnosis_sync(ctx: dict[str, Any]) -> dict[str, Any]:
+    fault_type = str(ctx.get("fault_type", "guidance_neo4j_slow_cypher"))
+    return {
+        "a2a_status": "DEGRADED",
+        "source": "a2a-sync-fallback",
+        "fault_type": fault_type,
+        "error": "Synchronous fallback invoked without async A2AClient.",
+    }
+
+
+async def _delegate_a2a_diagnosis_async(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Discover peer Agent Card via A2AClient and delegate read-only diagnostic task."""
+    a2a_client: A2AClient | None = ctx.get("a2a_client")
+    peer_urls: list[str] = list(ctx.get("a2a_peer_urls") or [])
+    fault_type = str(ctx.get("fault_type", ""))
+    service_name = str(ctx.get("service_name", "guidance-service"))
+    incident_id = str(ctx.get("incident_id", ""))
+
+    target_skill = (
+        "diagnose_rag_pipeline"
+        if "rag" in fault_type.lower()
+        else "diagnose_neo4j_cypher"
+    )
+    if a2a_client is None or not peer_urls:
+        return {
+            "a2a_status": "DEGRADED",
+            "target_skill": target_skill,
+            "source": "a2a-unconfigured",
+            "error": "No A2A peer URLs configured; safely degraded without blocking worker.",
+            "artifacts": {},
+        }
+
+    try:
+        found = await a2a_client.find_peer_for_skill(peer_urls, target_skill)
+    except Exception as exc:
+        return {
+            "a2a_status": "FAILED",
+            "target_skill": target_skill,
+            "source": "a2a-discovery-error",
+            "error": str(exc),
+            "artifacts": {},
+        }
+
+    if found is None:
+        return {
+            "a2a_status": "UNREACHABLE",
+            "target_skill": target_skill,
+            "source": "a2a-discovery",
+            "error": f"No reachable A2A peer advertises skill `{target_skill}`.",
+            "artifacts": {},
+        }
+
+    peer_url, peer_card = found
+    req = A2ATaskRequest(
+        task_id=f"a2a-{uuid4().hex[:12]}",
+        skill_id=target_skill,
+        input={"service_name": service_name, "fault_type": fault_type},
+        metadata={"incident_id": incident_id, "fault_type": fault_type},
+    )
+    try:
+        resp = await a2a_client.send_task(peer_url, req)
+    except A2AClientError as exc:
+        return {
+            "a2a_status": "FAILED",
+            "peer_name": peer_card.name,
+            "peer_url": peer_url,
+            "target_skill": target_skill,
+            "task_id": req.task_id,
+            "source": f"a2a:{peer_card.name}",
+            "error": f"{exc.code}: {exc.message}",
+            "artifacts": {},
+        }
+
+    if resp.state != "COMPLETED":
+        return {
+            "a2a_status": resp.state,
+            "peer_name": peer_card.name,
+            "peer_url": peer_url,
+            "target_skill": target_skill,
+            "task_id": resp.task_id,
+            "source": f"a2a:{peer_card.name}",
+            "error": resp.error or f"Peer returned state={resp.state}",
+            "artifacts": resp.artifacts,
+        }
+
+    return {
+        "a2a_status": "COMPLETED",
+        "peer_name": peer_card.name,
+        "peer_url": peer_url,
+        "target_skill": target_skill,
+        "task_id": resp.task_id,
+        "source": f"a2a:{peer_card.name}",
+        "artifacts": resp.artifacts,
+        **resp.artifacts,
+    }
+
+
 class ToolRegistry:
     """Registry of read-only diagnostic and high-risk write remediation tools."""
 
@@ -359,6 +484,13 @@ class ToolRegistry:
                 live_handler=_live_inspect_redis_hotkeys,
             ),
             ToolSpec(
+                name="delegate_a2a_diagnosis",
+                permission=ToolPermission.READ_ONLY,
+                description="Discover external peer via A2A /.well-known/agent.json and delegate read-only diagnosis.",
+                handler=_delegate_a2a_diagnosis_sync,
+                live_handler=_delegate_a2a_diagnosis_async,
+            ),
+            ToolSpec(
                 name="terminate_idle_in_tx_and_recycle_pool",
                 permission=ToolPermission.HIGH_RISK_WRITE,
                 description="Terminate idle-in-transaction PG16 backends and recycle pool.",
@@ -375,6 +507,18 @@ class ToolRegistry:
                 permission=ToolPermission.HIGH_RISK_WRITE,
                 description="Enable singleflight coalescing and prewarm Redis hot keys.",
                 handler=_enable_singleflight_and_prewarm_hotkey,
+            ),
+            ToolSpec(
+                name="create_neo4j_index_and_throttle_cypher",
+                permission=ToolPermission.HIGH_RISK_WRITE,
+                description="Create missing Neo4j Concept index and throttle concurrent Cypher queries.",
+                handler=_create_neo4j_index_and_throttle_cypher,
+            ),
+            ToolSpec(
+                name="tune_rag_retrieval_and_enable_degrade",
+                permission=ToolPermission.HIGH_RISK_WRITE,
+                description="Tune RAG HNSW efSearch and enable BM25 hybrid fallback.",
+                handler=_tune_rag_retrieval_and_enable_degrade,
             ),
         ]:
             self._tools[spec.name] = spec
@@ -462,7 +606,7 @@ class PolicyGuard:
             approval=approval,
         )
         if (
-            self.registry.execution_mode == "live"
+            (self.registry.execution_mode == "live" or spec.name == "delegate_a2a_diagnosis")
             and spec.permission == ToolPermission.READ_ONLY
             and spec.live_handler is not None
         ):

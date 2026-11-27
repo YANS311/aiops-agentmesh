@@ -1,0 +1,22 @@
+skill_id: skill.guidance.rag_retrieval_degradation
+fault_type: guidance_rag_retrieval_degradation
+title: Academy Guidance RAG Retrieval Latency & Empty-Recall SOP
+description: >
+  Delegates read-only RAG pipeline telemetry to the Academy Guidance A2A Adapter, inspects gateway
+  timeout logs, and gates vector search parameter tuning / circuit degradation behind SRE approval.
+default_severity: P1
+default_service: guidance-rag-service
+diagnostic_tools:
+  log_agent: query_gateway_latency_logs
+  db_agent: delegate_a2a_diagnosis
+remediation:
+  tool_name: tune_rag_retrieval_and_enable_degrade
+  risk_level: HIGH
+  requires_human_approval: true
+  command_template: >
+    curl -X POST http://{service_name}/admin/rag/config -d '{{"efSearch": 128, "top_k": 8, "bm25_fallback": true}}'
+  blast_radius: >
+    Lowers HNSW efSearch from 512 to 128 and enables BM25 hybrid fallback on {service_name};
+    reduces P99 retrieval latency below 450ms with minor recall trade-off.
+  rollback_command: >
+    curl -X POST http://{service_name}/admin/rag/config -d '{{"efSearch": 512, "top_k": 12, "bm25_fallback": false}}'

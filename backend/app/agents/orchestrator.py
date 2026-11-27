@@ -11,6 +11,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 
+from app.a2a.client import A2AClient
 from app.agents.consensus import run_parallel_diagnosis_and_attribution
 from app.agents.llm import LLMProvider, MalformedLLMOutputError
 from app.agents.reliability import OutboxRelay
@@ -88,6 +89,8 @@ class AIOpsOrchestrator:
         trajectory_consumer: "TrajectoryStreamConsumer | None" = None,
         outbox_relay: OutboxRelay | None = None,
         lease_seconds: float = DEFAULT_LEASE_SECONDS,
+        a2a_client: A2AClient | None = None,
+        a2a_peer_urls: list[str] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.redis_bus = redis_bus
@@ -101,6 +104,8 @@ class AIOpsOrchestrator:
             session_factory=session_factory, redis_bus=redis_bus
         )
         self.lease_seconds = lease_seconds
+        self.a2a_client = a2a_client or A2AClient()
+        self.a2a_peer_urls = list(a2a_peer_urls or [])
         self._worker_wakeups: set[asyncio.Event] = set()
 
     def register_worker_wakeup(self, ev: asyncio.Event) -> None:
@@ -609,10 +614,14 @@ class AIOpsOrchestrator:
             tool_name=plan.tool_name,
             incident=incident,
             context={
+                "incident_id": str(incident.id),
+                "fault_type": incident.fault_type,
                 "service_name": incident.service_name,
                 "alert_payload": incident.alert_payload,
                 "db_session": session,
                 "redis_client": self.redis_bus.redis,
+                "a2a_client": self.a2a_client,
+                "a2a_peer_urls": self.a2a_peer_urls,
             },
             approval=None,
         )
@@ -631,8 +640,41 @@ class AIOpsOrchestrator:
 
         bb = dict(incident.blackboard or {})
         evidence = dict(bb.get("evidence") or {})
-        evidence_key = "log_diagnostics" if task.agent_role == "LOG_DIAGNOSTICS" else "db_diagnostics"
-        evidence[evidence_key] = tool_output
+        if spec.name == "delegate_a2a_diagnosis":
+            a2a_status = str(tool_output.get("a2a_status", "FAILED"))
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role=task.agent_role,
+                    event_type="A2A_TASK_DELEGATED",
+                    risk_tier="READ_ONLY",
+                    summary=f"Delegated A2A read-only skill `{tool_output.get('target_skill')}` to {tool_output.get('peer_url', 'peer')}",
+                    payload={
+                        "target_skill": tool_output.get("target_skill"),
+                        "peer_url": tool_output.get("peer_url"),
+                        "a2a_task_id": tool_output.get("task_id"),
+                    },
+                )
+            )
+            pending_events.append(
+                await append_trace_event(
+                    session,
+                    incident_id=incident.id,
+                    agent_role=task.agent_role,
+                    event_type="A2A_TASK_COMPLETED" if a2a_status == "COMPLETED" else "A2A_TASK_FAILED",
+                    risk_tier="READ_ONLY",
+                    summary=(
+                        f"A2A skill `{tool_output.get('target_skill')}` finished with state={a2a_status}"
+                    ),
+                    payload=tool_output,
+                )
+            )
+            bb["a2a_artifacts"] = tool_output.get("artifacts", {})
+            evidence["a2a_diagnosis"] = tool_output
+        else:
+            evidence_key = "log_diagnostics" if task.agent_role == "LOG_DIAGNOSTICS" else "db_diagnostics"
+            evidence[evidence_key] = tool_output
         bb["evidence"] = evidence
         incident.blackboard = bb
         flag_modified(incident, "blackboard")

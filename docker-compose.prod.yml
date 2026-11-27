@@ -13,6 +13,9 @@ x-backend-env: &backend-env
   RBAC_VIEWER_TOKEN: ${RBAC_VIEWER_TOKEN:-viewer-demo-token}
   RBAC_APPROVER_TOKEN: ${RBAC_APPROVER_TOKEN:-sre-approver-demo-token}
   SHUTDOWN_TIMEOUT_SECONDS: "10"
+  A2A_PEER_URLS: ${A2A_PEER_URLS:-http://guidance-a2a-adapter:8020}
+  A2A_AUTH_TOKEN: ${A2A_AUTH_TOKEN:-}
+  A2A_TIMEOUT_SECONDS: "5.0"
 
 services:
   postgres:
@@ -98,6 +101,20 @@ services:
     depends_on:
       backend-api:
         condition: service_healthy
+
+  guidance-a2a-adapter:
+    build:
+      context: ./adapters/guidance_a2a_adapter
+      dockerfile: Dockerfile
+    environment:
+      ADAPTER_MODE: ${ADAPTER_MODE:-mock}
+      GUIDANCE_NEO4J_URI: ${GUIDANCE_NEO4J_URI:-}
+      GUIDANCE_RAG_METRICS_URL: ${GUIDANCE_RAG_METRICS_URL:-}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8020/health')\""]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
 volumes:
   pg16_prod_data:

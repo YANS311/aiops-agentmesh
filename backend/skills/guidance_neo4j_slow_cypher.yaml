@@ -1,0 +1,23 @@
+skill_id: skill.guidance.neo4j_slow_cypher
+fault_type: guidance_neo4j_slow_cypher
+title: Academy Guidance Neo4j Slow Cypher & Pool Saturation SOP
+description: >
+  Delegates read-only Neo4j Cypher and connection pool diagnostics to the Academy Guidance
+  A2A Adapter, correlates service error logs, and gates index creation / Cypher throttling behind SRE approval.
+default_severity: P1
+default_service: guidance-knowledge-graph
+diagnostic_tools:
+  log_agent: query_service_error_logs
+  db_agent: delegate_a2a_diagnosis
+remediation:
+  tool_name: create_neo4j_index_and_throttle_cypher
+  risk_level: HIGH
+  requires_human_approval: true
+  command_template: >
+    cypher-shell "CREATE INDEX idx_concept_course_id IF NOT EXISTS FOR (c:Concept) ON (c.course_id);" &&
+    curl -X POST http://{service_name}/admin/cypher/throttle?max_concurrent=16
+  blast_radius: >
+    Builds missing Neo4j Concept(course_id) index online and caps concurrent heavy graph traversals
+    for {service_name} to 16; briefly increases Neo4j CPU during index population.
+  rollback_command: >
+    curl -X POST http://{service_name}/admin/cypher/throttle?max_concurrent=64

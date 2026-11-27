@@ -7,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select, text
 
+from app.a2a.models import AgentCard, AgentCapabilities, AgentSkillCard
 from app.agents.orchestrator import (
     TERMINAL_INCIDENT_STATUSES,
     AIOpsOrchestrator,
@@ -64,6 +65,22 @@ async def get_current_actor(actor: Actor = Depends(require_authenticated)) -> Ac
     return ActorOut(actor_id=actor.actor_id, role=actor.role.value)
 
 
+@router.get("/a2a/peers")
+async def list_a2a_peers(request: Request) -> list[dict[str, Any]]:
+    a2a_client = request.app.state.a2a_client
+    peer_urls: list[str] = request.app.state.a2a_peer_urls
+    discovered = await a2a_client.discover_peers(peer_urls, use_cache=True)
+    return [
+        {
+            "base_url": item.base_url,
+            "status": item.status,
+            "card": item.card.model_dump(mode="json") if item.card else None,
+            "error": item.error,
+        }
+        for item in discovered
+    ]
+
+
 @router.get("/skills", response_model=list[SkillOut])
 async def get_skills(request: Request) -> list[SkillOut]:
     skills = request.app.state.skill_registry.list_skills()
@@ -105,6 +122,10 @@ def _infer_fault_type(labels: dict[str, str]) -> str:
     if explicit:
         return explicit
     alertname = labels.get("alertname", "").lower()
+    if "neo4j" in alertname or "cypher" in alertname:
+        return "guidance_neo4j_slow_cypher"
+    if "rag" in alertname or "recall" in alertname:
+        return "guidance_rag_retrieval_degradation"
     if "redis" in alertname or "cache" in alertname or "stampede" in alertname:
         return "redis_cache_stampede"
     if "lock" in alertname or "slow" in alertname:

@@ -469,6 +469,40 @@ class MockLLMProvider:
                     "缓存层未出现异常穿透或淘汰风暴，排除 Redis 热点问题，佐证为数据库行/表锁争用。",
                 ),
             }
+        elif fault_type == "guidance_neo4j_slow_cypher":
+            a2a_ev = evidence.get("a2a_diagnosis", {})
+            mapping = {
+                "DB_AGENT": (
+                    0.92,
+                    f"通过 A2A 导学适配器采集到 Neo4j 5分钟慢 Cypher 达 {a2a_ev.get('slow_cypher_count_5m', 27)} 次，"
+                    f"连接池使用率 {a2a_ev.get('connection_pool_utilization', 0.94)}，存在缺失索引告警。",
+                ),
+                "LOG_AGENT": (
+                    0.85,
+                    f"导学服务错误日志显示 {log_ev.get('error_count_5m', 418)} 次图谱查询超时异常。",
+                ),
+                "CACHE_AGENT": (
+                    0.30,
+                    "Redis 缓存状态平稳，排除热点缓存击穿，佐证瓶颈位于 Neo4j 图谱慢查询。",
+                ),
+            }
+        elif fault_type == "guidance_rag_retrieval_degradation":
+            a2a_ev = evidence.get("a2a_diagnosis", {})
+            mapping = {
+                "CACHE_AGENT": (
+                    0.91,
+                    f"通过 A2A 导学适配器观测到 RAG 检索 P99 延迟 {a2a_ev.get('rag_p99_ms', 4910)}ms，"
+                    f"空召回率升至 {a2a_ev.get('empty_recall_rate', 0.31)}。",
+                ),
+                "LOG_AGENT": (
+                    0.84,
+                    f"网关捕获 {log_ev.get('http_504_count_1m', 219)} 次 504 超时，集中于导学 RAG 检索链路。",
+                ),
+                "DB_AGENT": (
+                    0.35,
+                    "关系库与图库连接正常，符合向量检索参数过高引发的检索退化特征。",
+                ),
+            }
         else:
             mapping = {
                 "CACHE_AGENT": (
@@ -523,6 +557,18 @@ class MockLLMProvider:
                 f"Bulk batch UPDATE PIDs {db_ev.get('blocking_pids', [41892, 41907])} hold "
                 f"{db_ev.get('lock_mode', 'ExclusiveLock')} on {db_ev.get('blocked_relation', 'orders_ledger')}, "
                 f"blocking {log_ev.get('blocked_queries', 63)} queries (p99={log_ev.get('p99_latency_ms', 14200)}ms)."
+            )
+        elif fault_type == "guidance_neo4j_slow_cypher":
+            a2a_ev = blackboard.get("a2a_diagnosis", {})
+            root_cause = (
+                f"{service_name} Neo4j 知识图谱出现 {a2a_ev.get('slow_cypher_count_5m', 27)} 次慢 Cypher 查询"
+                f"（连接池使用率 {a2a_ev.get('connection_pool_utilization', 0.94)}），需补建 Concept 索引并限流。"
+            )
+        elif fault_type == "guidance_rag_retrieval_degradation":
+            a2a_ev = blackboard.get("a2a_diagnosis", {})
+            root_cause = (
+                f"{service_name} RAG 检索链路 P99 延迟达 {a2a_ev.get('rag_p99_ms', 4910)}ms，"
+                f"空召回率 {a2a_ev.get('empty_recall_rate', 0.31)}，需下调 efSearch 并开启 BM25 降级。"
             )
         else:
             root_cause = (

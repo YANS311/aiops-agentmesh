@@ -6,7 +6,7 @@
 Production-grade multi-agent AIOps troubleshooting control plane built with **Python 3.12 + FastAPI + PostgreSQL 16 + Redis 7 + Alembic + Prometheus** and **Vite + React + TypeScript + Tailwind CSS + Nginx**.
 
 > **Automated CI/CD Pipeline**:
-> - **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 31-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
+> - **CI** ([.github/workflows/ci.yml](.github/workflows/ci.yml)): Triggered on every `push` / `pull_request` to `main` with two parallel jobs — `backend-ci` (real `postgres:16` + `redis:7` service containers, `LLM_PROVIDER=mock`, `alembic upgrade head` on an empty DB, and full 35-test `pytest -v`) and `frontend-ci` (Node 20 `npm ci` + `npm run build` with `tsc -b`, plus `docker compose -f docker-compose.prod.yml config -q`).
 > - **CD** ([.github/workflows/cd.yml](.github/workflows/cd.yml)): Triggered on `v*` release tags to build and push multi-service container images (`backend` & `frontend`) to **GitHub Container Registry (GHCR)** and publish the **GitHub Release** with `docker-compose.prod.yml`.
 
 ## Architecture Highlights
@@ -25,6 +25,10 @@ Production-grade multi-agent AIOps troubleshooting control plane built with **Py
   - **Prometheus `/metrics`**: exposes `aiops_incidents_total`, `aiops_task_duration_seconds`, `aiops_fail_closed_blocks_total`, `aiops_outbox_pending_events`, and `aiops_dead_letter_tasks_total`.
   - **JSON Structured Logging**: unified JSON log formatter automatically carrying `incident_id`, `task_id`, `actor_id`, and `actor_role`.
   - **Graceful Shutdown**: FastAPI `lifespan` stops claiming new tasks, drains in-flight worker tasks and flushes pending `outbox_events` (bounded by `SHUTDOWN_TIMEOUT_SECONDS`) before closing Redis and PG16 connection pools.
+- **Standard A2A (Agent-to-Agent) Protocol & Academy Guidance Integration (`Phase 6.1`)**:
+  - Exposes `GET /.well-known/agent.json` and `GET /api/v1/a2a/peers` via `backend/app/a2a/` (`AgentCard`, `A2ATaskRequest`, `A2ATaskResponse`, async `A2AClient` with card caching & timeout circuit breaking).
+  - Includes standalone lightweight `adapters/guidance_a2a_adapter/` (`ADAPTER_MODE=live|mock`), exposing read-only skills `diagnose_neo4j_cypher` & `diagnose_rag_pipeline` (strictly rejecting undeclared/write requests with `state="REJECTED"`).
+  - Runbooks `guidance_neo4j_slow_cypher.yaml` and `guidance_rag_retrieval_degradation.yaml` delegate read-only diagnosis via `delegate_a2a_diagnosis`, archive A2A artifacts + traces (`A2A_TASK_DELEGATED` / `A2A_TASK_COMPLETED` / `A2A_TASK_FAILED`), and gate all remediations behind `SRE_APPROVER`.
 - **Decoupled 6-Container Production Architecture, Live Probes & Alertmanager Storm Dedup (`Phase 5`)**:
   - **Process Decoupling (`EMBEDDED_WORKERS=false`)**: FastAPI `backend-api` serves only HTTP/SSE traffic; `backend-worker` (`python -m app.entrypoints.worker`) runs `AgentWorker` + `LeaseWatchdog` (horizontally scalable via `--scale backend-worker=N`); `backend-relay` (`python -m app.entrypoints.relay`) runs `OutboxRelay` + `TrajectoryStreamConsumer`, each with independent healthchecks and `SIGTERM` graceful drain.
   - **Live Read-Only Probes (`TOOL_EXECUTION_MODE=live|mock`)**: In `live` mode, diagnostic tools execute real queries against PostgreSQL 16 (`pg_stat_activity`, `pg_locks`) and Redis 7 (`INFO memory`, `INFO stats`, `SLOWLOG GET`), while all `HIGH_RISK_WRITE` tools remain strictly Fail-Closed.

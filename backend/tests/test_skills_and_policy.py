@@ -16,7 +16,7 @@ def test_declarative_runbook_skills_load() -> None:
     settings = get_settings()
     registry = SkillRegistry(settings.skills_dir)
     skills = registry.list_skills()
-    assert len(skills) == 3
+    assert len(skills) == 5
 
     pool_skill = registry.match_for_fault("db_connection_pool_exhausted")
     assert pool_skill is not None

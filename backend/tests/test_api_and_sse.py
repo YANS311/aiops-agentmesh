@@ -35,7 +35,7 @@ async def test_api_end_to_end_fail_closed_approval_and_sse_stream(
 
             skills_resp = await client.get("/api/v1/skills")
             assert skills_resp.status_code == 200
-            assert len(skills_resp.json()) == 3
+            assert len(skills_resp.json()) == 5
 
             # 1. Inject fault incident
             inject_resp = await client.post(

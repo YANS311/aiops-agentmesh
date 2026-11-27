@@ -12,6 +12,7 @@ import sys
 import redis.asyncio as aioredis
 from sqlalchemy import text
 
+from app.a2a.client import A2AClient
 from app.agents.llm import build_llm_provider
 from app.agents.orchestrator import AgentWorker, AIOpsOrchestrator
 from app.agents.reliability import LeaseWatchdog, OutboxRelay
@@ -65,6 +66,10 @@ async def run_worker_service(
     # Non-running OutboxRelay handle: worker only commits outbox_events in PG16;
     # the dedicated relay container publishes them to Redis Streams.
     passive_relay = OutboxRelay(session_factory=session_factory, redis_bus=redis_bus)
+    a2a_client = A2AClient(
+        timeout_seconds=cfg.a2a_timeout_seconds,
+        auth_token=cfg.a2a_auth_token,
+    )
     orchestrator = AIOpsOrchestrator(
         session_factory=session_factory,
         redis_bus=redis_bus,
@@ -75,6 +80,8 @@ async def run_worker_service(
         trajectory_consumer=None,
         outbox_relay=passive_relay,
         lease_seconds=cfg.task_lease_seconds,
+        a2a_client=a2a_client,
+        a2a_peer_urls=cfg.parsed_a2a_peer_urls(),
     )
     worker = AgentWorker(orchestrator, worker_id=resolved_worker_id, trajectory_consumer=None)
     watchdog = LeaseWatchdog(orchestrator, interval_seconds=cfg.watchdog_interval_seconds)

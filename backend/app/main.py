@@ -7,6 +7,8 @@ from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 import redis.asyncio as aioredis
 
+from app.a2a.client import A2AClient
+from app.a2a.models import AgentCapabilities, AgentCard, AgentSkillCard
 from app.agents.llm import LLMProvider, build_llm_provider
 from app.agents.orchestrator import AgentWorker, AIOpsOrchestrator
 from app.agents.reliability import LeaseWatchdog, OutboxRelay
@@ -34,6 +36,8 @@ def create_app(
     start_worker: bool | None = None,
     auto_init_db: bool | None = None,
     tool_execution_mode: str | None = None,
+    a2a_client: A2AClient | None = None,
+    a2a_peer_urls: list[str] | None = None,
 ) -> FastAPI:
     resolved_settings = settings or get_settings()
     resolved_db_url = database_url or resolved_settings.database_url
@@ -46,6 +50,13 @@ def create_app(
         resolved_settings.embedded_workers if start_worker is None else start_worker
     )
     resolved_tool_mode = tool_execution_mode or resolved_settings.tool_execution_mode
+    resolved_a2a_peers = (
+        resolved_settings.parsed_a2a_peer_urls() if a2a_peer_urls is None else a2a_peer_urls
+    )
+    resolved_a2a_client = a2a_client or A2AClient(
+        timeout_seconds=resolved_settings.a2a_timeout_seconds,
+        auth_token=resolved_settings.a2a_auth_token,
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -84,6 +95,8 @@ def create_app(
             trajectory_consumer=trajectory_consumer if run_embedded else None,
             outbox_relay=outbox_relay,
             lease_seconds=resolved_settings.task_lease_seconds,
+            a2a_client=resolved_a2a_client,
+            a2a_peer_urls=resolved_a2a_peers,
         )
         worker = AgentWorker(
             orchestrator,
@@ -101,6 +114,8 @@ def create_app(
         app.state.redis_bus = redis_bus
         app.state.skill_registry = skill_registry
         app.state.tool_registry = tool_registry
+        app.state.a2a_client = resolved_a2a_client
+        app.state.a2a_peer_urls = resolved_a2a_peers
         app.state.orchestrator = orchestrator
         app.state.embedded_workers = run_embedded
         app.state.trajectory_consumer = trajectory_consumer
@@ -165,6 +180,41 @@ def create_app(
         allow_headers=["*"],
     )
     app.include_router(api_router)
+
+    @app.get("/.well-known/agent.json", response_model=AgentCard, include_in_schema=True)
+    async def well_known_agent_card(request: Request) -> AgentCard:
+        base_url = str(request.base_url).rstrip("/")
+        return AgentCard(
+            name="aiops-agentmesh-control-plane",
+            description=(
+                "Enterprise AIOps Multi-Agent Troubleshooting Control Plane with PG16 SKIP LOCKED "
+                "dispatch, Redis Streams, Consensus Arbiter, Exact Shapley Attribution, and Fail-Closed Gate."
+            ),
+            url=base_url,
+            version="1.0.0",
+            capabilities=AgentCapabilities(
+                streaming=True,
+                pushNotifications=False,
+                stateTransitionHistory=True,
+                readOnlyDiagnosticsOnly=False,
+            ),
+            skills=[
+                AgentSkillCard(
+                    id="aiops_multi_agent_triage",
+                    name="Multi-Agent Triage & Consensus Arbitration",
+                    description="Parallel DB/Cache/Log diagnosis, weighted consensus arbitration, and exact 2^3 Shapley attribution.",
+                    permission="READ_ONLY",
+                    tags=["aiops", "triage", "consensus", "shapley"],
+                ),
+                AgentSkillCard(
+                    id="fail_closed_remediation_gate",
+                    name="Human-Gated High-Risk Remediation",
+                    description="Enforces RBAC SRE_APPROVER sign-off before executing any HIGH_RISK_WRITE remediation.",
+                    permission="HIGH_RISK_GATED",
+                    tags=["rbac", "fail-closed", "remediation"],
+                ),
+            ],
+        )
 
     @app.get("/metrics", include_in_schema=False)
     async def prometheus_metrics(request: Request) -> Response:

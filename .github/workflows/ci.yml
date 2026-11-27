@@ -48,6 +48,7 @@ jobs:
       AUTO_INIT_DB: "false"
       EMBEDDED_WORKERS: "false"
       TOOL_EXECUTION_MODE: mock
+      A2A_PEER_URLS: ""
       DATABASE_URL: postgresql+asyncpg://aiops:aiops_ci_pwd@127.0.0.1:5432/aiops_mesh
       TEST_DATABASE_URL: postgresql+asyncpg://aiops:aiops_ci_pwd@127.0.0.1:5432/aiops_mesh_test
       REDIS_URL: redis://127.0.0.1:6379/0
